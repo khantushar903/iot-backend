@@ -8,7 +8,8 @@ from pydantic import ValidationError
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import Telemetry
-from app.schemas import TelemetryCreate
+from app.redis import publish_live_telemetry
+from app.schemas import TelemetryCreate, TelemetryResponse
 
 logger = logging.getLogger("iot-backend")
 
@@ -35,14 +36,22 @@ async def _process_message(message: aiomqtt.Message) -> None:
             data,
         )
         return
+    record = Telemetry(**telemetry.model_dump())
     try:
         async with AsyncSessionLocal() as session:
-            session.add(Telemetry(**telemetry.model_dump()))
+            session.add(record)
             await session.commit()
+            await session.refresh(record)
     except Exception:
         logger.exception(
             "Database write failed for device %s", telemetry.device_id
         )
+        return
+    response = TelemetryResponse.model_validate(record)
+    payload = json.dumps(
+        {"type": "telemetry", "data": response.model_dump(mode="json")}
+    )
+    await publish_live_telemetry(payload)
 
 
 async def mqtt_consumer() -> None:
