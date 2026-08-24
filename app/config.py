@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     mqtt_host: str = "mosquitto"
     mqtt_port: int = 1883
+    mqtt_topic: str = "telemetry/motors"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

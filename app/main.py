@@ -1,5 +1,6 @@
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import (
     Depends,
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal, Base, engine
 from app.models import Telemetry
+from app.mqtt import mqtt_consumer
 from app.schemas import TelemetryCreate, TelemetryResponse
 
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +25,13 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables ensured")
+
+    mqtt_task = asyncio.create_task(mqtt_consumer(), name="mqtt-consumer")
     yield
+
+    mqtt_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await mqtt_task
     await engine.dispose()
 
 
