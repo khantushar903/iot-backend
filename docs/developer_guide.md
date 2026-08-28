@@ -229,6 +229,63 @@ else:
 
 Writing the ping doubles as a liveness probe — dead sockets raise on write, converting silent disconnects into handled errors. A `finally` block unsubscribes and closes the Pub/Sub on every exit path, so churn can't leak connections.
 
+### 2.8 `app/crud.py` — thin DB-access helpers
+
+A small data-access layer that keeps query logic out of the route handlers and centralizes reuse. Every function takes an `AsyncSession` and returns plain ORM objects (`from_attributes` schemas serialize them later):
+
+```python
+async def create_alert(db, alert_in: AlertCreate) -> Alert:
+    alert = Alert(**alert_in.model_dump())     # build ORM row from validated input
+    db.add(alert)
+    await db.commit()                          # persist + release (expire_on_commit=False)
+    await db.refresh(alert)                    # pull server-generated id / created_at
+    return alert
+
+async def get_alerts(db, limit=50) -> list[Alert]:
+    # newest first, capped
+    return (await db.execute(select(Alert).order_by(Alert.id.desc()).limit(limit))).scalars().all()
+
+async def get_telemetry_history(db, device_id=None, limit=100, offset=0):
+    stmt = select(Telemetry).order_by(Telemetry.id.desc()).limit(limit)
+    if device_id is not None:
+        stmt = stmt.where(Telemetry.device_id == device_id)   # optional per-device filter
+    if offset:
+        stmt = stmt.offset(offset)                             # cursor-style pagination
+    return (await db.execute(stmt)).scalars().all()
+```
+
+### 2.9 `app/celery_app.py` — the task queue instance
+
+```python
+celery_app = Celery(
+    "iot_analytics",
+    broker=settings.redis_url,     # Redis is the task queue
+    backend=settings.redis_url,    # and the result store
+)
+celery_app.conf.update(task_serializer="json", result_serializer="json",
+                       accept_content=["json"], timezone="UTC", enable_utc=True)
+```
+
+`settings.redis_url` is read via pydantic-settings from `.env`, so the worker and API agree on the broker. The worker container runs `celery -A app.analytics.celery_app worker --loglevel=info` — note the app module is `analytics.py`, because that is where the actual task lives.
+
+### 2.10 `app/analytics.py` — the FFT / ISO 10816 worker
+
+`process_vibration_window` is a `@celery_app.task` decorated with `bind=True` (so `self` gives task controls). It is a normal sync Python function — worker threads run it — and it deliberately does the pure-math first, then bridges into async I/O only for the alert side-effect:
+
+```python
+velocity = cumulative_trapezoid(arr - arr.mean(), dx=dt, initial=0.0)   # accel → velocity
+rms_velocity = float(np.sqrt(np.mean(velocity**2)) * 1000.0)            # → mm/s RMS
+freqs  = fft.rfftfreq(len(arr), d=dt)                                    # FFT bins
+spectrum = np.abs(fft.rfft(arr - arr.mean()))
+peak_freq = float(freqs[int(np.argmax(spectrum))])                       # dominant Hz
+
+for lower, upper, code, name in ISO_10816_ZONES:   # A/B/C/D lookup
+    if (lower is None or rms_velocity >= lower) and (upper is None or rms_velocity < upper):
+        zone, threshold = code, upper; break
+```
+
+When the zone is `C` or `D`, the task builds an alert and calls the async bridge `asyncio.run(_persist_and_broadcast(alert_data))`. Inside that coroutine a dedicated `AsyncSessionLocal` inserts the `Alert`, then the committed record is serialized with `AlertResponse` and published as `{"type":"alert","data":{...}}` to `live_telemetry`. Because this is a raw `redis.asyncio` client, it must run inside an event loop — hence `asyncio.run(...)` rather than calling Redis synchronously.
+
 ---
 
 ## Part 3 — Hands-On Tutorial: Add a New Metric
@@ -354,6 +411,54 @@ Omitting `vibration_rms` from a payload now fails schema validation (logged and 
 - [ ] Verified in Adminer + REST + WebSocket
 - [ ] `docs/context.md` payload contract updated
 
+## Part 3½ — Hands-On: Alerts & the Celery Analytics Worker
+
+Two ways to exercise the Phase 2 alert path without the real signal chain.
+
+### Option A — Manual alert via the REST API
+
+`POST /api/v1/alerts` inserts an `Alert` row directly and returns `201`. It does **not** re-run the FFT (that is the analytics engine's job), but it is the quickest way to populate history and see the response shape:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/alerts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_id": "motor-04",
+    "severity": "CRITICAL",
+    "metric": "vibration",
+    "value": 9.2,
+    "threshold": 7.1,
+    "message": "Vibration 9.20 mm/s in ISO 10816 zone D (Unacceptable)"
+  }' -w '\nHTTP %{http_code}\n'   # expect 201 with the created alert
+
+# Read it back (newest first)
+curl "http://localhost:8000/api/v1/alerts?limit=5"
+```
+
+### Option B — Watch the Celery worker process a real window
+
+First make sure the worker is up:
+
+```bash
+docker compose ps                        # iot-celery-worker should be running
+docker compose logs -f celery_worker     # follow the analytics task output
+```
+
+Then, from `docker compose exec api` (or anywhere the `app` package is importable), dispatch a synthetic high-vibration window straight onto the task queue:
+
+```bash
+docker compose exec api python -c "
+import random
+from app.analytics import process_vibration_window
+samples = [9.8 + random.gauss(0, 1.5) for _ in range(256)]
+print(process_vibration_window.signature(
+    args=('motor-99', samples), kwargs={'sample_rate_hz': 50}
+).delay().get(timeout=30))
+"
+```
+
+A window this energetic lands in Zone D, so the worker persists an `Alert`, broadcasts `{"type":"alert",...}` to `live_telemetry`, and the returned dict shows `severity: "CRITICAL"` / `alert_raised: True`. Watch `docker compose logs -f celery_worker` to see the `Alert raised for device ...` line, then confirm the row at `GET /api/v1/alerts` or in Adminer (`alerts` table).
+
 ---
 
 ## Part 4 — Troubleshooting & Debugging Guide
@@ -363,9 +468,10 @@ Omitting `vibration_rms` from a payload now fails schema validation (logged and 
 Logs are the fastest signal. Follow one service live:
 
 ```bash
-docker compose logs -f api          # follow the API (ingestion, WS, errors)
+docker compose logs -f api             # follow the API (ingestion, WS, errors)
+docker compose logs -f celery_worker   # follow the analytics worker (FFT/alerts)
 docker compose logs -f postgres
-docker compose logs --tail 100 api  # last 100 lines, no following
+docker compose logs --tail 100 api     # last 100 lines, no following
 ```
 
 Known log lines and what they mean:
@@ -377,6 +483,7 @@ Known log lines and what they mean:
 | `Database write failed for device X` | Insert rejected (missing column? DB down?) | See 4.2 |
 | `Redis publish to live_telemetry failed` | Streaming degraded; storage unaffected | Check redis container |
 | `MQTT error: ... reconnecting in Ns` | Broker blip; backoff in progress | Usually self-heals |
+| `Alert raised for device X: CRITICAL (...) mm/s` | Analytics engine persisted + broadcast an alert | Expected WARNING/CRITICAL output — inspect `GET /api/v1/alerts` |
 | `Dashboard client disconnected` | Normal WS close | Nothing |
 
 ### 4.2 Database connection problems
@@ -446,14 +553,17 @@ docker compose exec redis redis-cli SUBSCRIBE live_telemetry
 | Container | Ports | Role |
 | --- | --- | --- |
 | `iot-api` | 8000 | FastAPI: REST + `/ws/telemetry` + Swagger at `/docs` |
-| `iot-postgres` | 5432 | Storage (`iot_user` / `iot_password` / `iot_db`) |
-| `iot-redis` | 6379 | Pub/Sub backbone (`live_telemetry`) |
+| `iot-celery-worker` | (none) | Celery worker: FFT + ISO 10816 analysis, alert persistence |
+| `iot-postgres` | 5432 | Storage: `telemetry_records` + `alerts` (`iot_user` / `iot_password` / `iot_db`) |
+| `iot-redis` | 6379 | Pub/Sub backbone (`live_telemetry`) + Celery broker/backend |
 | `iot-mosquitto` | 1883 / 9001 | MQTT broker (TCP / WS) |
 | `iot-adminer` | 8080 | Browser DB UI |
 
 ```bash
 docker compose exec postgres psql -U iot_user -d iot_db                 # SQL shell
 docker compose exec postgres psql -U iot_user -d iot_db -c '\d telemetry_records'
+docker compose exec postgres psql -U iot_user -d iot_db -c '\d alerts'
 docker compose exec redis redis-cli MONITOR                             # raw Redis traffic
 docker compose restart mosquitto                                        # rehearse broker failure
+docker compose logs -f celery_worker                                    # FFT/alert activity
 ```

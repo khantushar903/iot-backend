@@ -13,6 +13,7 @@ sequenceDiagram
     participant VAL as Pydantic validation
     participant PG as PostgreSQL
     participant RD as Redis Pub/Sub
+    participant CEL as Celery worker (app/analytics.py)
     actor DASH as Dashboard client
 
     ESP->>MQ: PUBLISH telemetry/motors (JSON)
@@ -27,6 +28,15 @@ sequenceDiagram
         PG-->>ING: id, created_at materialized
         ING->>RD: PUBLISH live_telemetry<br/>{"type":"telemetry","data":{...}}
         RD-->>DASH: frame fanned out to every subscriber
+
+        opt window of samples ready
+            CEL->>CEL: FFT + integrate → RMS velocity (mm/s)<br/>ISO 10816 zone A–D
+            alt Zone C or D (WARNING / CRITICAL)
+                CEL->>PG: INSERT alerts<br/>(asyncio.run + AsyncSession)
+                CEL->>RD: PUBLISH live_telemetry<br/>{"type":"alert","data":{...}}
+                RD-->>DASH: alert frame fanned out
+            end
+        end
     end
 ```
 
@@ -74,6 +84,21 @@ Delivery semantics are QoS 0 (fire-and-forget): for high-frequency vibration mon
 | `ts` | `BigInteger`, nullable | Client-side Unix epoch seconds |
 | `accel_x/y/z` | `Float` | Vibration axes |
 | `temp_c` | `Float` | Temperature |
+| `created_at` | `DateTime(timezone=True)` | `server_default=func.now()` |
+
+### Table `alerts`
+
+Produced by the Celery analytics engine (and writable via `POST /api/v1/alerts`); consumed by the history/alert REST endpoints.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | `BigInteger` PK | Auto-increment |
+| `device_id` | `String(64)` | Indexed — per-device alert filtering |
+| `severity` | `String(32)` | `WARNING` or `CRITICAL` |
+| `metric` | `String(32)` | `vibration` (currently the only metric) |
+| `value` | `Float` | Observed RMS velocity (mm/s) at alert time |
+| `threshold` | `Float` | Zone boundary that was breached |
+| `message` | `String(255)` | Human-readable alert text |
 | `created_at` | `DateTime(timezone=True)` | `server_default=func.now()` |
 
 ### Why auto-increment `id` orders records (not `ts`)
@@ -136,9 +161,37 @@ Key design points:
 | --- | --- | --- |
 | `snapshot` | `{"type":"snapshot","data":[≤10 records]}` | Once, immediately after accept |
 | `telemetry` | `{"type":"telemetry","data":{record}}` | Per ingested reading |
+| `alert` | `{"type":"alert","data":{alert record}}` | When the Celery engine raises WARNING/CRITICAL |
 | `ping` | `{"type":"ping"}` | Every ~20 s of silence |
 
-## 4. Fault Tolerance
+## 4. Analytics Engine (`app/celery_app.py`, `app/analytics.py`)
+
+### Celery instance
+`celery_app = Celery("iot_analytics", broker=settings.redis_url, backend=settings.redis_url)` — Redis doubles as both the task queue and the result backend. The worker runs in a separate container (`iot-celery-worker`) that shares the project image, so the analytics code and everything it imports (`crud`, models, schemas, Redis) are always in sync with the API.
+
+### `process_vibration_window` task
+Distributed as `app.analytics.process_vibration_window(device_id, accel_samples, sample_rate_hz=1)`. The worker is synchronous by nature, so the task's math runs on the worker thread and all persistence/broadcast I/O happens *after* classification:
+
+1. **Velocity integration.** `numpy.asarray` wraps the sample list; the mean is removed (detrend) and `scipy.integrate.cumulative_trapezoid(..., dx=1/sample_rate)` converts acceleration to velocity. RMS velocity is `sqrt(mean(v²))` scaled to mm/s (`× 1000`).
+2. **FFT.** `scipy.fft.rfft` on the detrended signal with `rfftfreq(n, d=dt)` yields the spectrum; the index of the maximum magnitude gives the dominant frequency (Hz).
+3. **ISO 10816-1 zoning.** The RMS velocity is matched against the `ISO_10816_ZONES` table (`(lower, upper, code, name)`):
+
+   | Zone | RMS Velocity (mm/s) | Status |
+   | --- | --- | --- |
+   | **A** | < 1.12 | Good |
+   | **B** | 1.12 – 2.80 | Satisfactory |
+   | **C** | 2.80 – 7.10 | Unsatisfactory → `WARNING` |
+   | **D** | > 7.10 | Unacceptable → `CRITICAL` |
+
+### Alert persistence & broadcast
+When the zone is C or D, the task builds an `alert_data` dict (device_id, severity, metric, value, threshold, message) and bridges into the async world with `asyncio.run(_persist_and_broadcast(alert_data))`:
+
+- **Persist:** a dedicated `AsyncSessionLocal` inserts an `Alert` row, then `refresh` materializes `id`/`created_at` — the same session-isolation pattern ingestion uses.
+- **Broadcast:** the committed alert is serialized with `AlertResponse.model_dump(mode="json")` and published to the shared `live_telemetry` channel as `{"type":"alert","data":{...}}`, so it arrives on every subscribed dashboard. Publish failures are logged but never abort the worker (persistence is the source of truth).
+
+The worker returns a JSON-serializable dict (`device_id`, `rms_velocity_mm_s`, `peak_frequency_hz`, `iso_zone`, `iso_zone_name`, `severity`, `alert_raised`) as the task result.
+
+## 5. Fault Tolerance
 
 ### Session isolation per message
 Every message opens its own `AsyncSession` inside an `async with` block. Commit failures roll back and release that session alone; the next message starts from a clean session rather than inheriting broken transaction state. This is what makes poison pills structurally impossible to escalate.
@@ -158,7 +211,8 @@ Verified behavior: interleaving garbage and schema-violating frames between vali
 ### Dependency restarts
 - **Mosquitto restart:** consumer hits `MqttError`, backs off (1→30 s), resubscribes on recovery. Messages published during the gap are lost (QoS 0), never duplicated.
 - **PostgreSQL restart:** `pool_pre_ping` evicts dead connections on first touch; writes during the outage are logged and dropped, then resume automatically.
-- **Redis restart:** broadcast frames are lost for the outage window; snapshots on new connects self-heal any missed history.
+- **Redis restart:** broadcast frames are lost for the outage window; snapshots on new connects self-heal any missed history. Celery tasks queued during the outage are redelivered once Redis recovers (Redis is also the Celery broker); in-flight alert persistence/broadcast retry on restart.
+- **Celery worker restart / Redis broker outage:** pending vibration windows sit in the Redis queue; when the worker and broker are back, tasks resume. A WARNING/CRITICAL alert is persisted only after the worker successfully reaches the write step, keeping the `alerts` table the single source of truth.
 
 ### Graceful shutdown sequencing
 Lifespan teardown is ordered to prevent work against closed resources:
