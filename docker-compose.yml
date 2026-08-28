@@ -74,6 +74,20 @@ services:
       postgres:
         condition: service_healthy
 
+  celery_worker:
+    build: .
+    container_name: iot-celery-worker
+    restart: unless-stopped
+    command: celery -A app.analytics.celery_app worker --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-iot_user}:${POSTGRES_PASSWORD:-iot_password}@postgres:5432/${POSTGRES_DB:-iot_db}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   redis_data:

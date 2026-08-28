@@ -6,13 +6,15 @@ from fastapi import (
     Depends,
     FastAPI,
     HTTPException,
+    Query,
     WebSocket,
     WebSocketDisconnect,
     status,
 )
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import crud
 from app.database import AsyncSessionLocal, Base, engine
 from app.models import Telemetry
 from app.mqtt import mqtt_consumer
@@ -21,10 +23,21 @@ from app.redis import (
     get_live_telemetry_pubsub,
     redis_client,
 )
-from app.schemas import TelemetryCreate, TelemetryResponse
+from app.schemas import (
+    AlertCreate,
+    AlertResponse,
+    TelemetryCreate,
+    TelemetryResponse,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("iot-backend")
+
+_mqtt_task: asyncio.Task | None = None
+
+
+def _get_mqtt_task() -> asyncio.Task | None:
+    return _mqtt_task
 
 
 @asynccontextmanager
@@ -33,12 +46,13 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables ensured")
 
-    mqtt_task = asyncio.create_task(mqtt_consumer(), name="mqtt-consumer")
+    global _mqtt_task
+    _mqtt_task = asyncio.create_task(mqtt_consumer(), name="mqtt-consumer")
     yield
 
-    mqtt_task.cancel()
+    _mqtt_task.cancel()
     with suppress(asyncio.CancelledError):
-        await mqtt_task
+        await _mqtt_task
     await redis_client.aclose()
     await engine.dispose()
 
@@ -54,6 +68,76 @@ async def get_db():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/v1/health")
+async def health_v1():
+    db_status = "down"
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        db_status = "ok"
+    except Exception:
+        logger.exception("DB health check failed")
+
+    redis_status = "down"
+    try:
+        await redis_client.ping()
+        redis_status = "ok"
+    except Exception:
+        logger.exception("Redis health check failed")
+
+    mqtt_status = "down"
+    mqtt_task = _get_mqtt_task()
+    if mqtt_task is not None and not mqtt_task.done():
+        mqtt_status = "ok"
+
+    components = {
+        "database": db_status,
+        "redis": redis_status,
+        "mqtt": mqtt_status,
+    }
+    overall = "ok" if all(s == "ok" for s in components.values()) else "degraded"
+    return {"status": overall, "components": components}
+
+
+@app.post(
+    "/api/v1/alerts",
+    response_model=AlertResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_alert(
+    payload: AlertCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    alert = await crud.create_alert(db, payload)
+    return alert
+
+
+@app.get("/api/v1/alerts", response_model=list[AlertResponse])
+async def get_alerts(
+    limit: int = Query(50, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+):
+    return await crud.get_alerts(db, limit=limit)
+
+
+@app.get(
+    "/api/v1/telemetry/history",
+    response_model=list[TelemetryResponse],
+)
+async def get_telemetry_history(
+    device_id: str | None = Query(None, max_length=64),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    return await crud.get_telemetry_history(
+        db,
+        device_id=device_id,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @app.post(
