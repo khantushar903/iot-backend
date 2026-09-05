@@ -89,7 +89,13 @@ Plain English: pydantic-settings fills each field from environment variables (ca
 ### 2.2 `app/database.py` — engine and sessions
 
 ```python
-engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+from sqlalchemy.pool import NullPool
+
+engine = create_async_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    poolclass=NullPool,
+)
 
 AsyncSessionLocal = async_sessionmaker(
     engine,
@@ -100,7 +106,7 @@ AsyncSessionLocal = async_sessionmaker(
 
 Three ideas:
 
-- **Engine** — a pool of database connections created once at import time. `pool_pre_ping=True` sends a lightweight check before reusing a pooled connection, so a Postgres restart doesn't surface as random dead-connection errors.
+- **Engine** — a factory for database connections created once at import time. `pool_pre_ping=True` sends a lightweight check before reusing a pooled connection, so a Postgres restart doesn't surface as random dead-connection errors. `poolclass=NullPool` goes further: every checkout opens a fresh connection and closes it on return, so **no connection is ever cached across event loops**. This is what lets the same shared engine be used from Celery workers without tripping `RuntimeError: Event loop is closed` / `Future attached to a different loop`.
 - **Session factory** — calling `AsyncSessionLocal()` produces a fresh session (a single logical database conversation). Code always uses `async with AsyncSessionLocal() as session:` so the session closes deterministically even on exceptions.
 - **`expire_on_commit=False`** — normally, SQLAlchemy "expires" every object after commit, so touching any attribute triggers a surprise lazy-load query. That pattern fights async code (implicit I/O where you least expect it). Disabling expiration keeps objects fully readable after commit. Corollary: server-generated values (like `created_at`) do *not* appear automatically — which is why callers run `await session.refresh(record)` explicitly when they need them.
 
@@ -172,9 +178,12 @@ async with AsyncSessionLocal() as session:   # own session per message
     session.add(record); await session.commit()
     await session.refresh(record)       # pull id + created_at back
 await publish_live_telemetry(payload)   # only AFTER a successful commit
+await _buffer_vibration_window(device_id, x, y, z)   # feed the analytics sliding window
 ```
 
 Fail any gate → log a warning and return. A poison pill costs one log line, never the loop.
+
+**Sliding-window buffering.** `_buffer_vibration_window` computes the raw magnitude `sqrt(x²+y²+z²)`, `RPUSH`es it to the Redis list `vibration_buffer:{device_id}`, then `LTRIM`s the list to its last 30 entries. Only when the list holds ≥ 10 readings does it read the list back and dispatch `process_vibration_window.delay(device_id, samples, sample_rate_hz=1)` to the Celery queue. The window slides continuously: every new reading displaces the oldest, and a new analysis fires roughly every 10 readings per device. Any buffer failure is logged (`Vibration buffer update failed for device ...`) and swallowed — it never affects the telemetry record already committed or broadcast.
 
 ### 2.6 `app/redis.py` — the broadcast backbone
 
@@ -284,7 +293,37 @@ for lower, upper, code, name in ISO_10816_ZONES:   # A/B/C/D lookup
         zone, threshold = code, upper; break
 ```
 
-When the zone is `C` or `D`, the task builds an alert and calls the async bridge `asyncio.run(_persist_and_broadcast(alert_data))`. Inside that coroutine a dedicated `AsyncSessionLocal` inserts the `Alert`, then the committed record is serialized with `AlertResponse` and published as `{"type":"alert","data":{...}}` to `live_telemetry`. Because this is a raw `redis.asyncio` client, it must run inside an event loop — hence `asyncio.run(...)` rather than calling Redis synchronously.
+When the zone is `C` or `D`, the task builds an alert and calls the async bridge `run_async(_persist_and_broadcast(alert_data))`. Inside that coroutine a dedicated `AsyncSessionLocal` inserts the `Alert`, then the committed record is serialized with `AlertResponse` and published as `{"type":"alert","data":{...}}` to `live_telemetry`. Because this is a raw `redis.asyncio` client, it must run inside an event loop.
+
+**Why `run_async`, not `asyncio.run`.** Calling `asyncio.run(...)` per task would create and destroy an event loop on every dispatch. The module-level `AsyncSessionLocal` engine and `redis_client` would then try to reuse connections bound to a *closed* loop — the classic `RuntimeError: Event loop is closed` / `Future attached to a different loop`. Instead, `app/analytics.py` keeps one loop alive per worker process:
+
+```python
+_worker_loop: asyncio.AbstractEventLoop | None = None
+
+@celery_app.signals.worker_process_init.connect
+def _init_worker_loop(**kwargs):
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
+
+def run_async(coro):
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
+    _worker_loop.run_until_complete(coro)
+
+@celery_app.signals.worker_process_shutdown.connect
+def _shutdown_worker_loop(**kwargs):
+    if _worker_loop is None or _worker_loop.is_closed():
+        return
+    _worker_loop.run_until_complete(engine.dispose())
+    _worker_loop.run_until_complete(redis_client.aclose())
+    _worker_loop.close()
+```
+
+Every subsequent task dispatch reuses that same loop, so the pooled DB/Redis connections stay bound to a loop that is still running, and the `worker_process_shutdown` listener disposes everything cleanly before the fork exits. `NullPool` on the engine (Part 2.2) is a second, independent safety net.
 
 ---
 
@@ -481,6 +520,7 @@ Known log lines and what they mean:
 | `Dropping malformed JSON payload` | Non-JSON arrived on the topic | Check publisher firmware |
 | `Dropping payload failing schema validation` | Valid JSON, wrong shape | Compare against `TelemetryCreate` |
 | `Database write failed for device X` | Insert rejected (missing column? DB down?) | See 4.2 |
+| `Vibration buffer update failed for device X` | Redis list push/trim for the sliding window errored | Check redis container; the telemetry record itself is already stored |
 | `Redis publish to live_telemetry failed` | Streaming degraded; storage unaffected | Check redis container |
 | `MQTT error: ... reconnecting in Ns` | Broker blip; backoff in progress | Usually self-heals |
 | `Alert raised for device X: CRITICAL (...) mm/s` | Analytics engine persisted + broadcast an alert | Expected WARNING/CRITICAL output — inspect `GET /api/v1/alerts` |

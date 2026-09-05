@@ -7,7 +7,7 @@ from scipy import fft
 from scipy.integrate import cumulative_trapezoid
 
 from app.celery_app import celery_app
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, engine
 from app.models import Alert
 from app.redis import LIVE_TELEMETRY_CHANNEL, redis_client
 from app.schemas import AlertResponse
@@ -22,6 +22,50 @@ ISO_10816_ZONES = [
 ]
 
 METRIC = "vibration"
+
+_worker_loop: asyncio.AbstractEventLoop | None = None
+
+
+@celery_app.signals.worker_process_init.connect
+def _init_worker_loop(**kwargs) -> None:
+    """Create a single persistent event loop for each Celery worker process."""
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
+        logger.info("Worker process event loop initialized")
+
+
+def run_async(coro) -> None:
+    """Run an async coroutine on the worker process's persistent event loop."""
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
+    _worker_loop.run_until_complete(coro)
+
+
+@celery_app.signals.worker_process_shutdown.connect
+def _shutdown_worker_loop(**kwargs) -> None:
+    """Cleanly dispose of DB and Redis connections before the worker exits."""
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        return
+    try:
+        _worker_loop.run_until_complete(engine.dispose())
+    except Exception:
+        logger.exception("Failed to dispose database engine on worker shutdown")
+    try:
+        _worker_loop.run_until_complete(redis_client.aclose())
+    except Exception:
+        logger.exception("Failed to close Redis client on worker shutdown")
+    try:
+        _worker_loop.close()
+    except Exception:
+        logger.exception("Failed to close worker event loop")
+    _worker_loop = None
+    logger.info("Worker process event loop shut down cleanly")
+
 
 
 async def _persist_and_broadcast(alert_data: dict) -> None:
@@ -105,7 +149,7 @@ def process_vibration_window(
             "threshold": threshold,
             "message": message,
         }
-        asyncio.run(_persist_and_broadcast(alert_data))
+        run_async(_persist_and_broadcast(alert_data))
         logger.warning(
             "Alert raised for device %s: %s (%.2f mm/s)",
             device_id,

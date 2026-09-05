@@ -10,7 +10,7 @@ Legend: 🔒 **Frozen** (contract locked, no further schema/API changes without 
 
 The foundational ingest → persist → broadcast pipeline.
 
-- **MQTT ingestion** — `app/mqtt.py`: long-lived `aiomqtt` consumer on `telemetry/motors`, Pydantic validation, poison-pill containment, capped exponential reconnect backoff.
+- **MQTT ingestion** — `app/mqtt.py`: long-lived `aiomqtt` consumer on `telemetry/motors`, Pydantic validation, poison-pill containment, capped exponential reconnect backoff, and a per-device Redis sliding buffer (`vibration_buffer:{device_id}`, last 30 magnitudes) that dispatches windows to the analytics engine once ≥ 10 readings accumulate.
 - **Storage** — `app/database.py`, `app/models.py` (`telemetry_records`), SQLAlchemy 2.0 async + asyncpg.
 - **Broadcast** — `app/redis.py` (`live_telemetry` channel) + `/ws/telemetry` WebSocket fanout with snapshot/ping frames.
 - **Infrastructure** — Mosquitto, PostgreSQL, Redis, API, Adminer; health-gated Compose startup.
@@ -27,7 +27,9 @@ Adds background signal analysis, alert persistence/broadcast, and a historical R
   - Integration of acceleration → RMS velocity (mm/s) via `scipy.integrate.cumulative_trapezoid`.
   - Dominant frequency via `scipy.fft.rfft` / `rfftfreq`.
   - ISO 10816-1 classification into Zones A–D; Zone C → `WARNING`, Zone D → `CRITICAL`.
-  - On breach: persists an `Alert` to PostgreSQL (async session via `asyncio.run`) and publishes `{"type":"alert","data":{...}}` to `live_telemetry`.
+  - On breach: persists an `Alert` to PostgreSQL (async session) and publishes `{"type":"alert","data":{...}}` to `live_telemetry`.
+  - Async I/O runs on **one persistent event loop per worker process**: `worker_process_init` creates it, `run_async` runs coroutines on it, and `worker_process_shutdown` disposes the DB engine and closes the Redis client. The shared async engine uses `NullPool` (`app/database.py`) so no connection is cached across loops — eliminating `Event loop is closed` / `attached to a different loop` errors under consecutive dispatches.
+- **Verification script** — `scripts/test_vibration_task.py`: dispatches 5 sequential `process_vibration_window` tasks across Celery workers and prints each task id + completion status.
 - **Container** — `celery_worker` service in `docker-compose.yml` (`celery -A app.analytics.celery_app worker --loglevel=info`).
 - **REST endpoints** —
   - `GET /api/v1/health` (DB / Redis / MQTT status)
@@ -36,7 +38,7 @@ Adds background signal analysis, alert persistence/broadcast, and a historical R
   - `POST /api/v1/alerts`
 - **WebSocket channel** now carries 4 frame types: `snapshot`, `telemetry`, `alert`, `ping`.
 
-**Verification performed:** syntax/compile checks pass; MQTT/Redis/Postgres health-gated Compose stack; alerts persisted and broadcast; history endpoints return expected rows; worker task dispatch exercised in-container.
+**Verification performed:** syntax/compile checks pass; MQTT/Redis/Postgres health-gated Compose stack; sliding-window buffer accumulates magnitudes and dispatches ≥10-reading windows; alerts persisted and broadcast on a persistent per-worker event loop; history endpoints return expected rows; worker task dispatch exercised in-container and via `scripts/test_vibration_task.py`.
 
 ## Phase 3 — (Planned / Not Started)
 

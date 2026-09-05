@@ -15,8 +15,8 @@ A scalable, event-driven IoT backend that monitors motor health using vibration 
 
 ```
 Infrastructure → Schemas → Async Ingestion → DB Persistence → Redis Pub/Sub → WebSocket Fanout
-                                                                      ↘
-                                                              Celery FFT / ISO 10816 → Alert Persistence → Broadcast
+                                      ↘
+        Redis sliding buffer (per device) → Celery FFT / ISO 10816 → Alert Persistence → Broadcast
 ```
 
 | Stage | Implementation | Responsibility |
@@ -26,7 +26,7 @@ Infrastructure → Schemas → Async Ingestion → DB Persistence → Redis Pub/
 | 3. Async Ingestion | `app/mqtt.py` | Long-lived `aiomqtt` consumer on `telemetry/motors`; validate-then-persist per message |
 | 4. DB Persistence | `app/database.py`, `app/models.py` | Async engine/session factory; `telemetry_records` and `alerts` tables with indexed `device_id` |
 | 5. Redis Pub/Sub | `app/redis.py` | Fan-out of persisted records on channel `live_telemetry` |
-| 6. Analytics Engine | `app/celery_app.py`, `app/analytics.py` | Celery worker runs FFT + ISO 10816-1 RMS velocity classification; persists + broadcasts alerts |
+| 6. Analytics Engine | `app/celery_app.py`, `app/analytics.py` | Celery worker runs FFT + ISO 10816-1 RMS velocity classification; persists + broadcasts alerts on a single persistent event loop per worker process |
 | 7. WebSocket Fanout | `app/main.py` (`/ws/telemetry`) | Snapshot-on-connect + verbatim relay of live frames + alert frames + idle keepalive |
 
 ## Data Flow (as implemented)
@@ -35,9 +35,10 @@ Infrastructure → Schemas → Async Ingestion → DB Persistence → Redis Pub/
 3. Each payload is parsed and validated by Pydantic (`TelemetryCreate`); failures are logged and dropped without disturbing the consumer loop.
 4. Valid readings are inserted into PostgreSQL through a dedicated `AsyncSession` per message; the row is refreshed so server-generated fields (`id`, `created_at`) are populated.
 5. The serialized record is published once to the Redis channel `live_telemetry`; streaming failures never block ingestion.
-6. Windows of accelerometer samples are queued to a Celery worker, which integrates acceleration into RMS velocity (mm/s), computes the dominant frequency via FFT, and classifies against ISO 10816-1 zones (A–D).
-7. When a WARNING (Zone C) or CRITICAL (Zone D) threshold is breached, the worker persists an `Alert` row to PostgreSQL and publishes `{"type":"alert","data":{...}}` to `live_telemetry`.
-8. Dashboard clients connect to `/ws/telemetry`, receive a snapshot of the last 10 records, then receive every subsequent telemetry/alert frame in real time.
+6. After each valid reading, the consumer pushes the raw acceleration magnitude `sqrt(aₓ²+a_y²+a_z²)` onto a per-device sliding window keyed `vibration_buffer:{device_id}` in Redis (retaining only the last 30 readings). Once a window holds ≥ 10 readings, it is dispatched to a Celery worker.
+7. The Celery worker integrates the acceleration window into RMS velocity (mm/s), computes the dominant frequency via FFT, and classifies against ISO 10816-1 zones (A–D).
+8. When a WARNING (Zone C) or CRITICAL (Zone D) threshold is breached, the worker persists an `Alert` row to PostgreSQL and publishes `{"type":"alert","data":{...}}` to `live_telemetry`.
+9. Dashboard clients connect to `/ws/telemetry`, receive a snapshot of the last 10 records, then receive every subsequent telemetry/alert frame in real time.
 
 ## ISO 10816-1 Vibration Velocity Classification
 
@@ -80,6 +81,6 @@ Alert (persisted by the analytics engine, readable via `GET /api/v1/alerts`, and
 ```
 
 ## Development Rules
-*   Use fully asynchronous Python code (`async def`, `aiomqtt`, asyncpg via `async_sessionmaker`); Celery tasks run in a sync context and bridge to async I/O via `asyncio.run(...)`.
+*   Use fully asynchronous Python code (`async def`, `aiomqtt`, asyncpg via `async_sessionmaker`); Celery tasks run in a sync context and bridge to async I/O via `run_async(...)` on a single persistent event loop per worker process (`worker_process_init`/`worker_process_shutdown` in `app/analytics.py`) — never `asyncio.run(...)` per task.
 *   Keep files modular (`config.py`, `database.py`, `models.py`, `schemas.py`, `crud.py`, `mqtt.py`, `redis.py`, `celery_app.py`, `analytics.py`, `main.py`).
 *   Include proper error handling and logging; a bad message or a degraded dependency must never crash the pipeline.

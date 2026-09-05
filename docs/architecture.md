@@ -29,12 +29,16 @@ sequenceDiagram
         ING->>RD: PUBLISH live_telemetry<br/>{"type":"telemetry","data":{...}}
         RD-->>DASH: frame fanned out to every subscriber
 
-        opt window of samples ready
-            CEL->>CEL: FFT + integrate → RMS velocity (mm/s)<br/>ISO 10816 zone A–D
-            alt Zone C or D (WARNING / CRITICAL)
-                CEL->>PG: INSERT alerts<br/>(asyncio.run + AsyncSession)
-                CEL->>RD: PUBLISH live_telemetry<br/>{"type":"alert","data":{...}}
-                RD-->>DASH: alert frame fanned out
+        opt per valid reading
+            ING->>RD: RPUSH vibration_buffer:<device_id><br/>+ LTRIM last 30 magnitudes
+            opt buffer length ≥ 10
+                ING-->>CEL: process_vibration_window.delay(device_id, samples, 1 Hz)
+                CEL->>CEL: FFT + integrate → RMS velocity (mm/s)<br/>ISO 10816 zone A–D
+                alt Zone C or D (WARNING / CRITICAL)
+                    CEL->>PG: INSERT alerts<br/>(run_async on persistent worker loop)
+                    CEL->>RD: PUBLISH live_telemetry<br/>{"type":"alert","data":{...}}
+                    RD-->>DASH: alert frame fanned out
+                end
             end
         end
     end
@@ -68,11 +72,24 @@ Both gates *return early* rather than raise past the loop — a poison pill cost
 
 Delivery semantics are QoS 0 (fire-and-forget): for high-frequency vibration monitoring an occasional dropped reading is preferable to broker-side queuing lag. The pipeline is therefore at-most-once per attempt, with no duplicate-suppression complexity.
 
+### Sliding-window vibration buffering
+After a record is persisted and broadcast, the consumer feeds the analytics engine through a Redis-backed sliding window (see `_buffer_vibration_window` in `app/mqtt.py`):
+
+```python
+mag = sqrt(accel_x**2 + accel_y**2 + accel_z**2)   # raw acceleration magnitude
+await redis_client.rpush(key, mag)                 # key: vibration_buffer:<device_id>
+await redis_client.ltrim(key, -30, -1)             # retain only the last 30 readings
+```
+
+- Each valid reading **RPUSH**es its magnitude to `vibration_buffer:{device_id}` and then **LTRIM**s the list to its last **30** entries, so a device's buffer never grows unbounded.
+- Only when `LLEN >= 10` does the consumer read the list back, convert entries to `float`, and dispatch **`process_vibration_window.delay(device_id, samples, sample_rate_hz=1)`** to the Celery queue (`BUFFER_DISPATCH_THRESHOLD = 10`, `BUFFER_SAMPLE_RATE_HZ = 1`).
+- A buffer update failure is caught and logged (`Vibration buffer update failed for device ...`) — it never aborts ingestion or affects the already-committed telemetry record/broadcast.
+
 ## 2. Database Design (`app/database.py`, `app/models.py`)
 
 ### SQLAlchemy 2.0 async patterns
 - `DeclarativeBase` with `Mapped[...]` / `mapped_column` typed declarations — full IDE/type-checker support.
-- Engine created once with `pool_pre_ping=True`: stale connections killed by Postgres restarts are detected and replaced transparently instead of surfacing as errors mid-request.
+- Engine created once with `pool_pre_ping=True` **and** `poolclass=NullPool`: stale connections killed by Postgres restarts are detected and replaced transparently, and no connection is cached across event loops. `NullPool` (one connection per checkout, closed on return) is the key to keeping the shared async engine safe when async I/O runs inside Celery workers — pooled connections bound to a closed event loop are never handed back out.
 - Sessions come from `async_sessionmaker(engine, expire_on_commit=False)`: committed objects stay usable without implicit lazy-load round trips.
 
 ### Table `telemetry_records`
@@ -184,10 +201,18 @@ Distributed as `app.analytics.process_vibration_window(device_id, accel_samples,
    | **D** | > 7.10 | Unacceptable → `CRITICAL` |
 
 ### Alert persistence & broadcast
-When the zone is C or D, the task builds an `alert_data` dict (device_id, severity, metric, value, threshold, message) and bridges into the async world with `asyncio.run(_persist_and_broadcast(alert_data))`:
+When the zone is C or D, the task builds an `alert_data` dict (device_id, severity, metric, value, threshold, message) and bridges into the async world with `run_async(_persist_and_broadcast(alert_data))`:
 
 - **Persist:** a dedicated `AsyncSessionLocal` inserts an `Alert` row, then `refresh` materializes `id`/`created_at` — the same session-isolation pattern ingestion uses.
 - **Broadcast:** the committed alert is serialized with `AlertResponse.model_dump(mode="json")` and published to the shared `live_telemetry` channel as `{"type":"alert","data":{...}}`, so it arrives on every subscribed dashboard. Publish failures are logged but never abort the worker (persistence is the source of truth).
+
+### Async bridge: one persistent event loop per worker process
+The worker is synchronous (ForkPoolWorker threads), but persistence/broadcast need async I/O. Instead of `asyncio.run(...)` — which creates and destroys a fresh loop per task and strands pooled connections (the classic `RuntimeError: Event loop is closed` / `Future attached to a different loop`) — `app/analytics.py` keeps **one loop alive per worker process**:
+
+- `@worker_process_init.connect` → `_init_worker_loop` creates a single `asyncio.new_event_loop()` and installs it as the process loop at worker startup.
+- `run_async(coro)` runs a coroutine on that stable loop via `loop.run_until_complete(coro)` (lazily (re)creating the loop if missing/closed). Because the same loop persists across task dispatches, the module-level `AsyncSessionLocal` engine and `redis_client` pools stay bound to one live loop.
+- `@worker_process_shutdown.connect` → `_shutdown_worker_loop` runs `engine.dispose()` and `redis_client.aclose()` on the loop, then closes the loop itself — clean teardown before the fork exits.
+- Combined with `NullPool` on the engine (`app/database.py`), no DB connection is ever cached across loops, so consecutive task dispatches on the same worker are safe.
 
 The worker returns a JSON-serializable dict (`device_id`, `rms_velocity_mm_s`, `peak_frequency_hz`, `iso_zone`, `iso_zone_name`, `severity`, `alert_raised`) as the task result.
 
