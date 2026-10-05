@@ -14,13 +14,6 @@ from app.schemas import AlertResponse
 
 logger = logging.getLogger("iot-backend")
 
-ISO_10816_ZONES = [
-    (None, 1.12, "A", "Good"),
-    (1.12, 2.80, "B", "Satisfactory"),
-    (2.80, 7.10, "C", "Unsatisfactory"),
-    (7.10, None, "D", "Unacceptable"),
-]
-
 METRIC = "vibration"
 
 _worker_loop: asyncio.AbstractEventLoop | None = None
@@ -91,7 +84,7 @@ def process_vibration_window(
     self,
     device_id: str,
     accel_samples: list[float],
-    sample_rate_hz: int = 1,
+    sample_rate_hz: int = 500,
 ) -> dict:
     if not accel_samples:
         raise ValueError("accel_samples must not be empty")
@@ -99,43 +92,44 @@ def process_vibration_window(
     arr = np.asarray(accel_samples, dtype=float)
     dt = 1.0 / sample_rate_hz
 
-    velocity = cumulative_trapezoid(arr - arr.mean(), dx=dt, initial=0.0)
-    rms_velocity = float(np.sqrt(np.mean(velocity**2)) * 1000.0)
+    # Subtract mean to remove gravity bias
+    arr_zero_mean = arr - arr.mean()
+    
+    # Calculate acceleration metrics
+    rms_accel = float(np.sqrt(np.mean(arr_zero_mean**2)))
+    peak_accel = float(np.max(np.abs(arr_zero_mean)))
+    peak_to_peak = float(np.max(arr) - np.min(arr))
+    crest_factor = float(peak_accel / rms_accel) if rms_accel > 0 else 1.0
 
-    freqs = fft.rfftfreq(len(arr), d=dt)
-    spectrum = np.abs(fft.rfft(arr - arr.mean()))
+    # Calculate dominant frequency
+    freqs = fft.rfftfreq(len(arr_zero_mean), d=dt)
+    spectrum = np.abs(fft.rfft(arr_zero_mean))
     peak_index = int(np.argmax(spectrum))
     peak_freq = float(freqs[peak_index])
 
-    zone = None
-    zone_name = None
+    # Simple threshold-based alerting
+    WARNING_THRESHOLD = 2.0  # m/s^2
+    CRITICAL_THRESHOLD = 5.0 # m/s^2
+
     severity = None
     threshold = None
-    for lower, upper, code, name in ISO_10816_ZONES:
-        if (lower is None or rms_velocity >= lower) and (
-            upper is None or rms_velocity < upper
-        ):
-            zone = code
-            zone_name = name
-            threshold = upper if upper is not None else lower
-            break
-
-    if zone in ("C", "D"):
-        severity = "WARNING" if zone == "C" else "CRITICAL"
-        message = (
-            f"Vibration {rms_velocity:.2f} mm/s in ISO 10816 zone {zone} "
-            f"({zone_name}) — requires attention"
-        )
-    else:
-        severity = None
-        message = ""
+    message = ""
+    if rms_accel >= CRITICAL_THRESHOLD:
+        severity = "CRITICAL"
+        threshold = CRITICAL_THRESHOLD
+        message = f"Acceleration RMS ({rms_accel:.2f} m/s²) exceeds critical threshold."
+    elif rms_accel >= WARNING_THRESHOLD:
+        severity = "WARNING"
+        threshold = WARNING_THRESHOLD
+        message = f"Acceleration RMS ({rms_accel:.2f} m/s²) exceeds warning threshold."
 
     result = {
         "device_id": device_id,
-        "rms_velocity_mm_s": rms_velocity,
+        "rms_accel_m_s2": rms_accel,
+        "peak_accel_m_s2": peak_accel,
+        "peak_to_peak_m_s2": peak_to_peak,
+        "crest_factor": crest_factor,
         "peak_frequency_hz": peak_freq,
-        "iso_zone": zone,
-        "iso_zone_name": zone_name,
         "severity": severity,
         "alert_raised": severity is not None,
     }
@@ -145,16 +139,16 @@ def process_vibration_window(
             "device_id": device_id,
             "severity": severity,
             "metric": METRIC,
-            "value": rms_velocity,
+            "value": rms_accel,
             "threshold": threshold,
             "message": message,
         }
         run_async(_persist_and_broadcast(alert_data))
         logger.warning(
-            "Alert raised for device %s: %s (%.2f mm/s)",
+            "Alert raised for device %s: %s (%.2f m/s²)",
             device_id,
             severity,
-            rms_velocity,
+            rms_accel,
         )
 
     return result

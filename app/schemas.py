@@ -6,10 +6,10 @@ from pydantic import BaseModel, ConfigDict, Field
 class TelemetryCreate(BaseModel):
     device_id: str = Field(min_length=1, max_length=64)
     ts: int | None = None
-    accel_x: float
-    accel_y: float
-    accel_z: float
-    temp_c: float
+    accel_x: float = Field(ge=-100, le=100)
+    accel_y: float = Field(ge=-100, le=100)
+    accel_z: float = Field(ge=-100, le=100)
+    temp_c: float = Field(ge=-40, le=125)
 
 
 class TelemetryResponse(BaseModel):

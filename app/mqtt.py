@@ -21,9 +21,9 @@ _INITIAL_BACKOFF_S = 1.0
 _MAX_BACKOFF_S = 30.0
 
 BUFFER_KEY_PREFIX = "vibration_buffer:"
-BUFFER_MAX_LENGTH = 30
-BUFFER_DISPATCH_THRESHOLD = 10
-BUFFER_SAMPLE_RATE_HZ = 1
+BUFFER_MAX_LENGTH = 256
+BUFFER_DISPATCH_THRESHOLD = 256
+BUFFER_SAMPLE_RATE_HZ = 500
 
 
 async def _process_message(message: aiomqtt.Message) -> None:
@@ -65,15 +65,16 @@ async def _process_message(message: aiomqtt.Message) -> None:
 async def _buffer_vibration_window(
     device_id: str, accel_x: float, accel_y: float, accel_z: float
 ) -> None:
-    magnitude = math.sqrt(accel_x**2 + accel_y**2 + accel_z**2)
+    # Use accel_z as the primary vibration axis instead of magnitude
     key = f"{BUFFER_KEY_PREFIX}{device_id}"
     try:
-        await redis_client.rpush(key, magnitude)
-        await redis_client.ltrim(key, -BUFFER_MAX_LENGTH, -1)
+        await redis_client.rpush(key, accel_z)
         buffer_length = await redis_client.llen(key)
         if buffer_length >= BUFFER_DISPATCH_THRESHOLD:
             raw = await redis_client.lrange(key, 0, -1)
             samples = [float(v) for v in raw]
+            # Clear the buffer to prevent overlapping windows
+            await redis_client.delete(key)
             process_vibration_window.delay(
                 device_id, samples, sample_rate_hz=BUFFER_SAMPLE_RATE_HZ
             )
