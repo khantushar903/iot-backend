@@ -2,7 +2,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Alert, Telemetry
-from app.schemas import AlertCreate
+from app.schemas import AlertCreate, TelemetryCreate
+
+
+async def create_telemetry(db: AsyncSession, telemetry_in: TelemetryCreate) -> Telemetry:
+    telemetry = Telemetry(**telemetry_in.model_dump())
+    db.add(telemetry)
+    await db.commit()
+    await db.refresh(telemetry)
+    return telemetry
 
 
 async def create_alert(db: AsyncSession, alert_in: AlertCreate) -> Alert:
@@ -26,10 +34,11 @@ async def get_telemetry_history(
     limit: int = 100,
     offset: int = 0,
 ) -> list[Telemetry]:
-    statement = select(Telemetry).order_by(Telemetry.id.desc()).limit(limit)
+    statement = select(Telemetry).order_by(Telemetry.id.desc())
     if device_id is not None:
         statement = statement.where(Telemetry.device_id == device_id)
     if offset:
         statement = statement.offset(offset)
+    statement = statement.limit(limit)
     result = await db.execute(statement)
     return list(result.scalars().all())

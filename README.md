@@ -10,8 +10,8 @@ Event-driven telemetry backend for motor vibration and temperature analysis. ESP
 | [Eclipse Mosquitto](https://mosquitto.org/) 2.x | Lightweight MQTT message broker (TCP + WebSocket listeners) |
 | PostgreSQL 16 + `asyncpg` + SQLAlchemy 2 (async ORM) | Durable telemetry + alert storage |
 | Redis 7 (Pub/Sub) | In-memory fan-out of live telemetry & alert frames; Celery broker/backend |
-| [Celery](https://docs.celeryq.dev/) 5.x | Background worker for FFT / ISO 10816 vibration analysis |
-| SciPy + NumPy | Fast Fourier Transform & numerical integration for RMS velocity |
+| [Celery](https://docs.celeryq.dev/) 5.x | Background worker for vibration signal analysis & alerting |
+| SciPy + NumPy | Fast Fourier Transform, Hann windowing, spectral band energy |
 | Docker Compose | One-command orchestration of the full stack |
 | Adminer | Browser-based database administration |
 
@@ -41,7 +41,7 @@ Event-driven telemetry backend for motor vibration and temperature analysis. ESP
                                                                    └──────────────┘
 ```
 
-**Pipeline (6 stages):** every message is validated with Pydantic before it touches storage; records that fail validation are logged and dropped without affecting the consumer loop. After a successful insert the serialized record is published once to Redis, and each connected dashboard client receives it verbatim. Concurrently, windows of accelerometer samples are queued to a Celery worker that runs an FFT and ISO 10816-1 vibration classification — when a WARNING/CRITICAL threshold is breached, an `Alert` is persisted to PostgreSQL and broadcast to the same `live_telemetry` channel.
+**Pipeline (6 stages):** every message is validated with Pydantic before it touches storage; records that fail validation are logged and dropped without affecting the consumer loop. After a successful insert the serialized record is published once to Redis, and each connected dashboard client receives it verbatim. Concurrently, fixed windows of per-axis accelerometer samples are queued to a Celery worker, which removes gravity per axis, derives the sample rate from the device timestamps, and computes resultant RMS, peak, crest factor, and a Hann-windowed FFT (dominant frequency + high-frequency energy ratio). An alert lifecycle built on RMS thresholds, spectral escalation, hysteresis, and a cooldown decides whether to raise an `WARNING`/`CRITICAL` alert — or a `RESOLVED` one on recovery — which is persisted to PostgreSQL and broadcast to the same `live_telemetry` channel.
 
 ### API Surface
 
@@ -92,9 +92,9 @@ Alert record shape:
   "device_id": "motor-03",
   "severity": "CRITICAL",
   "metric": "vibration",
-  "value": 8.42,
-  "threshold": 7.1,
-  "message": "Vibration 8.42 mm/s in ISO 10816 zone D (Unacceptable) — requires attention",
+  "value": 6.42,
+  "threshold": 5.0,
+  "message": "CRITICAL acceleration RMS 6.42 m/s^2 (threshold 5.00), dominant 47.0 Hz on X, crest 3.10, HF energy 21%.",
   "created_at": "2026-08-28T09:15:02.510123Z"
 }
 ```
@@ -189,7 +189,8 @@ iot-backend/
 │   ├── mqtt.py          # aiomqtt consumer: validate → persist → publish
 │   ├── redis.py         # Redis Pub/Sub client & helpers
 │   ├── celery_app.py    # Celery instance (broker/backend = Redis)
-│   ├── analytics.py     # process_vibration_window Celery task (FFT + ISO 10816)
+│   ├── analytics.py     # analyze_window (pure signal math) + the Celery task
+│   ├── alert_state.py   # pure severity logic: hysteresis, cooldown, resolution
 │   └── main.py          # FastAPI routes, lifespan, WebSocket endpoint
 ├── docs/
 │   ├── architecture.md    # in-depth technical analysis (pipeline, DB, broadcast, faults)

@@ -30,12 +30,14 @@ sequenceDiagram
         RD-->>DASH: frame fanned out to every subscriber
 
         opt per valid reading
-            ING->>RD: RPUSH vibration_buffer:<device_id><br/>+ LTRIM last 30 magnitudes
-            opt buffer length ≥ 10
-                ING-->>CEL: process_vibration_window.delay(device_id, samples, 1 Hz)
-                CEL->>CEL: FFT + integrate → RMS velocity (mm/s)<br/>ISO 10816 zone A–D
-                alt Zone C or D (WARNING / CRITICAL)
-                    CEL->>PG: INSERT alerts<br/>(run_async on persistent worker loop)
+            ING->>RD: RPUSH vibration_buffer:<device_id><br/>per-axis {x,y,z,ts} sample
+            opt buffer length ≥ window size
+                ING->>RD: LTRIM consumed window
+                ING-->>CEL: process_vibration_window.delay(device_id, samples)
+                CEL->>CEL: per-axis DC removal (gravity)<br/>RMS · peak · crest · Hann-windowed FFT<br/>+ hysteresis/cooldown lifecycle
+                alt escalate · de-escalate · reminder · resolution
+                    CEL->>RD: GET/SET alert_state:<device_id>
+                    CEL->>PG: INSERT alerts<br/>(async_to_sync)
                     CEL->>RD: PUBLISH live_telemetry<br/>{"type":"alert","data":{...}}
                     RD-->>DASH: alert frame fanned out
                 end
@@ -72,17 +74,18 @@ Both gates *return early* rather than raise past the loop — a poison pill cost
 
 Delivery semantics are QoS 0 (fire-and-forget): for high-frequency vibration monitoring an occasional dropped reading is preferable to broker-side queuing lag. The pipeline is therefore at-most-once per attempt, with no duplicate-suppression complexity.
 
-### Sliding-window vibration buffering
-After a record is persisted and broadcast, the consumer feeds the analytics engine through a Redis-backed sliding window (see `_buffer_vibration_window` in `app/mqtt.py`):
+### Fixed-window vibration buffering
+After a record is persisted and broadcast, the consumer feeds the analytics engine through a Redis-backed window per device (see `_buffer_vibration_window` in `app/mqtt.py`):
 
 ```python
-mag = sqrt(accel_x**2 + accel_y**2 + accel_z**2)   # raw acceleration magnitude
-await redis_client.rpush(key, mag)                 # key: vibration_buffer:<device_id>
-await redis_client.ltrim(key, -30, -1)             # retain only the last 30 readings
+sample = {"x": accel_x, "y": accel_y, "z": accel_z, "ts": ts}
+await redis_client.rpush(key, json.dumps(sample))   # key: vibration_buffer:<device_id>
 ```
 
-- Each valid reading **RPUSH**es its magnitude to `vibration_buffer:{device_id}` and then **LTRIM**s the list to its last **30** entries, so a device's buffer never grows unbounded.
-- Only when `LLEN >= 10` does the consumer read the list back, convert entries to `float`, and dispatch **`process_vibration_window.delay(device_id, samples, sample_rate_hz=1)`** to the Celery queue (`BUFFER_DISPATCH_THRESHOLD = 10`, `BUFFER_SAMPLE_RATE_HZ = 1`).
+- Each valid reading **RPUSH**es a **per-axis** sample, not a pre-reduced magnitude. Keeping the axes intact is what lets the analyser remove gravity per axis and resolve a per-axis frequency; collapsing to `√(x²+y²+z²)` at ingest throws that information away permanently.
+- The window is **fixed-size and non-overlapping**: once `LLEN >= VIBRATION_WINDOW_SAMPLES` (default 512) the consumer reads exactly that many samples, **LTRIM**s them off the front, then dispatches. Consuming *before* dispatching means a broker failure loses one window instead of re-analysing the same window forever. Overflow samples are retained and seed the next window.
+- Backlog is bounded by `BUFFER_MAX_LENGTH` (3 × window). Anything beyond that is stale — a reconnecting device replaying, or a stalled worker — and is trimmed from the front with a warning.
+- Entries that fail to parse are logged and skipped; a short window is never dispatched.
 - A buffer update failure is caught and logged (`Vibration buffer update failed for device ...`) — it never aborts ingestion or affects the already-committed telemetry record/broadcast.
 
 ## 2. Database Design (`app/database.py`, `app/models.py`)
@@ -111,10 +114,10 @@ Produced by the Celery analytics engine (and writable via `POST /api/v1/alerts`)
 | --- | --- | --- |
 | `id` | `BigInteger` PK | Auto-increment |
 | `device_id` | `String(64)` | Indexed — per-device alert filtering |
-| `severity` | `String(32)` | `WARNING` or `CRITICAL` |
+| `severity` | `String(32)` | `WARNING`, `CRITICAL`, or `RESOLVED` |
 | `metric` | `String(32)` | `vibration` (currently the only metric) |
-| `value` | `Float` | Observed RMS velocity (mm/s) at alert time |
-| `threshold` | `Float` | Zone boundary that was breached |
+| `value` | `Float` | Observed resultant acceleration RMS (m/s²) at alert time |
+| `threshold` | `Float` | Severity entry level that was breached |
 | `message` | `String(255)` | Human-readable alert text |
 | `created_at` | `DateTime(timezone=True)` | `server_default=func.now()` |
 
@@ -186,35 +189,68 @@ Key design points:
 ### Celery instance
 `celery_app = Celery("iot_analytics", broker=settings.redis_url, backend=settings.redis_url)` — Redis doubles as both the task queue and the result backend. The worker runs in a separate container (`iot-celery-worker`) that shares the project image, so the analytics code and everything it imports (`crud`, models, schemas, Redis) are always in sync with the API.
 
-### `process_vibration_window` task
-Distributed as `app.analytics.process_vibration_window(device_id, accel_samples, sample_rate_hz=1)`. The worker is synchronous by nature, so the task's math runs on the worker thread and all persistence/broadcast I/O happens *after* classification:
+### Signal analysis: `analyze_window`
+All signal math lives in the pure function `app.analytics.analyze_window(samples) -> dict`. It takes a list of per-axis samples and returns metrics, with no Redis, Celery, or database involved, which is what makes `scripts/check_analytics.py` able to verify it against synthetic signals with known answers.
 
-1. **Velocity integration.** `numpy.asarray` wraps the sample list; the mean is removed (detrend) and `scipy.integrate.cumulative_trapezoid(..., dx=1/sample_rate)` converts acceleration to velocity. RMS velocity is `sqrt(mean(v²))` scaled to mm/s (`× 1000`).
-2. **FFT.** `scipy.fft.rfft` on the detrended signal with `rfftfreq(n, d=dt)` yields the spectrum; the index of the maximum magnitude gives the dominant frequency (Hz).
-3. **ISO 10816-1 zoning.** The RMS velocity is matched against the `ISO_10816_ZONES` table (`(lower, upper, code, name)`):
+The stages, and why each one is there:
 
-   | Zone | RMS Velocity (mm/s) | Status |
-   | --- | --- | --- |
-   | **A** | < 1.12 | Good |
-   | **B** | 1.12 – 2.80 | Satisfactory |
-   | **C** | 2.80 – 7.10 | Unsatisfactory → `WARNING` |
-   | **D** | > 7.10 | Unacceptable → `CRITICAL` |
+1. **Gravity and bias removal.** Each axis has its own DC component removed (`values - values.mean()`). Gravity is a constant offset on whichever axis the board happens to be mounted on, so removing it per axis removes it *regardless of orientation* — no assumption about which axis is vertical, and slow bias goes with it. Every metric below is computed from this AC signal.
+
+   This is why the buffer keeps all three axes. Taking `√(x²+y²+z²)` at ingest would bake gravity into a ~9.81 m/s² offset and fold genuine 1× running-speed vibration into it non-linearly.
+
+2. **Sample rate from timestamps.** The rate is derived from the device's own `ts` values (`(n-1) / (t_last - t_first)`) rather than assumed. A wrong assumption scales the *entire* frequency axis by a constant factor and produces confident, plausible, wrong numbers. When timestamps are missing, non-increasing, or imply an implausible rate, the analyser falls back to `VIBRATION_FALLBACK_SAMPLE_RATE_HZ` and reports `sample_rate_source: "fallback"` so the caveat travels with the data instead of being hidden.
+
+3. **Time-domain metrics.** Per-axis and resultant acceleration RMS, per-axis and resultant peak, peak-to-peak, and crest factor (peak / RMS). The resultant is `√(x²+y²+z²)` of the *AC* components.
+
+4. **FFT.** A **Hann taper** is applied before `scipy.fft.rfft`, with `rfftfreq(n, d=dt)` giving the bin axis. The taper is not cosmetic: without it, spectral leakage smears energy across neighbouring bins and `argmax` can report a frequency that is not in the signal at all. `hf_energy_ratio` is the fraction of total spectral energy above `hf_band_start_fraction` × Nyquist.
+
+5. **Dominant frequency.** The peak of the total energy spectrum across all three axes, with `dominant_axis` naming the axis contributing most amplitude at that bin.
+
+### Severity classification
+Two-step, and the two steps are deliberately separate:
+
+**RMS thresholds** classify on resultant acceleration RMS (m/s²):
+
+| Level | Entry | Release |
+| --- | --- | --- |
+| `WARNING` | ≥ 2.0 | < 1.6 |
+| `CRITICAL` | ≥ 5.0 | < 4.0 |
+
+**Spectral escalation** promotes one step when the signal is impulsive and HF-dominated: `hf_energy_ratio >= 0.30` **and** `crest_factor >= 3.5`. Impulsive broadband energy with a low overall RMS is the classic early-bearing-fault signature, and it is the case a pure RMS method is blind to. Both conditions are required — smooth broadband noise satisfies neither, so ordinary noise cannot trigger it.
+
+`VIBRATION_SPECTRAL_ESCALATION_FROM_NORMAL` (default on) controls whether the spectrum may raise a `WARNING` when RMS is still nominal. That is the valuable behaviour for early detection and also the easiest way to manufacture false positives, so it is a switch rather than a fixed rule.
+
+> **On ISO 10816.** The system deliberately does **not** claim ISO 10816/20816 conformance. Those zones are defined on RMS *velocity* in mm/s, measured at a specified point on a machine of a specified class over a specified frequency range. This project measures *acceleration* from a single MPU6050 on a small motor, with no anti-alias filtering and no velocity integration, so applying those limits to these numbers would be unfounded. The thresholds here are project-defined and documented as such.
+
+### Alert lifecycle (`app/alert_state.py`)
+The decision logic is pure and synchronous — no I/O — so it is unit-testable and independent of Redis. `decide(previous_state, rms, spectral_escalation, now)` returns a severity, an `emit` flag, a `kind`, and a human-readable reason.
+
+**Hysteresis.** Severity is only released once the metric falls below the *clear* level for that severity. Without this, a motor sitting at 1.8 m/s² flaps between `NORMAL` and `WARNING` on every window, and a new alert row is written on each flap.
+
+**Cooldown.** While a severity stays active it is re-emitted only after `VIBRATION_ALERT_COOLDOWN_S` (default 300 s). Without this, an unhealthy motor produces one alert row per window, forever.
+
+**Kinds.**
+
+| Kind | When | Alert row severity |
+| --- | --- | --- |
+| `escalation` | Severity rose | the new severity |
+| `deescalation` | Severity dropped but stayed above `NORMAL` | the new severity |
+| `reminder` | Still breaching after the cooldown | unchanged severity |
+| `resolution` | Returned to `NORMAL` from an active state | `RESOLVED` |
+| `none` | Suppressed or steady | no row written |
+
+**State** is one JSON blob per device at `alert_state:{device_id}` (severity, `last_alert_at`, `updated_at`) with a TTL. Reads and writes never raise: a Redis outage costs hysteresis history, not vibration analysis. The worker uses a **blocking** Redis client (`sync_redis_client`) rather than bridging into asyncio to read one key.
 
 ### Alert persistence & broadcast
-When the zone is C or D, the task builds an `alert_data` dict (device_id, severity, metric, value, threshold, message) and bridges into the async world with `run_async(_persist_and_broadcast(alert_data))`:
+When `decide` returns `emit=True`, the task builds an `alert_data` dict (device_id, severity, metric, value, threshold, message) and bridges into the async world with `async_to_sync(_persist_and_broadcast(alert_data))`:
 
 - **Persist:** a dedicated `AsyncSessionLocal` inserts an `Alert` row, then `refresh` materializes `id`/`created_at` — the same session-isolation pattern ingestion uses.
 - **Broadcast:** the committed alert is serialized with `AlertResponse.model_dump(mode="json")` and published to the shared `live_telemetry` channel as `{"type":"alert","data":{...}}`, so it arrives on every subscribed dashboard. Publish failures are logged but never abort the worker (persistence is the source of truth).
 
-### Async bridge: one persistent event loop per worker process
-The worker is synchronous (ForkPoolWorker threads), but persistence/broadcast need async I/O. Instead of `asyncio.run(...)` — which creates and destroys a fresh loop per task and strands pooled connections (the classic `RuntimeError: Event loop is closed` / `Future attached to a different loop`) — `app/analytics.py` keeps **one loop alive per worker process**:
+### Async bridge
+The worker is synchronous but persistence and broadcast need async I/O. The bridge is `asgiref.sync.async_to_sync`, which runs the coroutine on a fresh loop per call. That is safe here because the engine uses `NullPool` (`app/database.py`) — no connection is cached across loops — and `redis_client` is only used for a single publish inside the same coroutine. If connection pooling is ever enabled on the engine, this needs revisiting: a persistent per-process loop would be required.
 
-- `@worker_process_init.connect` → `_init_worker_loop` creates a single `asyncio.new_event_loop()` and installs it as the process loop at worker startup.
-- `run_async(coro)` runs a coroutine on that stable loop via `loop.run_until_complete(coro)` (lazily (re)creating the loop if missing/closed). Because the same loop persists across task dispatches, the module-level `AsyncSessionLocal` engine and `redis_client` pools stay bound to one live loop.
-- `@worker_process_shutdown.connect` → `_shutdown_worker_loop` runs `engine.dispose()` and `redis_client.aclose()` on the loop, then closes the loop itself — clean teardown before the fork exits.
-- Combined with `NullPool` on the engine (`app/database.py`), no DB connection is ever cached across loops, so consecutive task dispatches on the same worker are safe.
-
-The worker returns a JSON-serializable dict (`device_id`, `rms_velocity_mm_s`, `peak_frequency_hz`, `iso_zone`, `iso_zone_name`, `severity`, `alert_raised`) as the task result.
+The task returns a JSON-serializable dict containing the full metric set — `rms_accel_m_s2`, per-axis RMS and peak, `peak_accel_m_s2`, `crest_factor`, `dominant_frequency_hz` (plus per-axis variants), `dominant_axis`, `hf_energy_ratio`, `spectral_escalation`, `window_samples`, `window_duration_s`, `sample_rate_hz`, `sample_rate_source`, `rms_severity` — alongside `previous_severity`, `severity`, `alert_kind`, `decision_reason`, and `alert_raised`.
 
 ## 5. Fault Tolerance
 
