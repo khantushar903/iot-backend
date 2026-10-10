@@ -1,12 +1,13 @@
 import asyncio
 import json
 import logging
+import math
 
 import aiomqtt
 from pydantic import ValidationError
 
 from app.analytics import process_vibration_window
-from app.config import settings, vibration
+from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import Telemetry
 from app.redis import publish_live_telemetry, redis_client
@@ -20,12 +21,9 @@ _INITIAL_BACKOFF_S = 1.0
 _MAX_BACKOFF_S = 30.0
 
 BUFFER_KEY_PREFIX = "vibration_buffer:"
-# A full window is dispatched as soon as this many samples have accumulated.
-BUFFER_DISPATCH_THRESHOLD = vibration.window_samples
-# Hard cap on buffered-but-not-yet-dispatched samples. Overflow beyond the cap
-# is stale backlog (a reconnecting device replaying, or a stalled analytics
-# worker) and is dropped from the front so memory stays bounded.
-BUFFER_MAX_LENGTH = BUFFER_DISPATCH_THRESHOLD * 3
+BUFFER_MAX_LENGTH = 30
+BUFFER_DISPATCH_THRESHOLD = 10
+BUFFER_SAMPLE_RATE_HZ = 1
 
 
 async def _process_message(message: aiomqtt.Message) -> None:
@@ -61,86 +59,27 @@ async def _process_message(message: aiomqtt.Message) -> None:
         {"type": "telemetry", "data": response.model_dump(mode="json")}
     )
     await publish_live_telemetry(payload)
-    await _buffer_vibration_window(telemetry)
+    await _buffer_vibration_window(telemetry.device_id, telemetry.accel_x, telemetry.accel_y, telemetry.accel_z)
 
 
-def _decode_samples(raw: list[str]) -> list[dict]:
-    """Parse buffered JSON samples, skipping anything unreadable."""
-    samples: list[dict] = []
-    for entry in raw:
-        try:
-            sample = json.loads(entry)
-            samples.append(
-                {
-                    "x": float(sample["x"]),
-                    "y": float(sample["y"]),
-                    "z": float(sample["z"]),
-                    "ts": sample.get("ts"),
-                }
-            )
-        except (ValueError, TypeError, KeyError):
-            logger.warning("Dropping malformed vibration buffer entry: %r", entry)
-    return samples
-
-
-async def _buffer_vibration_window(telemetry: TelemetryCreate) -> None:
-    """Accumulate per-axis samples into a per-device window.
-
-    Gravity is deliberately *not* removed here. Removing the DC component is
-    cheap and exact once a full window exists, and doing it downstream means we
-    never have to assume which axis the board is mounted on.
-    """
-    sample = json.dumps(
-        {
-            "x": telemetry.accel_x,
-            "y": telemetry.accel_y,
-            "z": telemetry.accel_z,
-            "ts": telemetry.ts,
-        },
-        separators=(",", ":"),
-    )
-    key = f"{BUFFER_KEY_PREFIX}{telemetry.device_id}"
+async def _buffer_vibration_window(
+    device_id: str, accel_x: float, accel_y: float, accel_z: float
+) -> None:
+    magnitude = math.sqrt(accel_x**2 + accel_y**2 + accel_z**2)
+    key = f"{BUFFER_KEY_PREFIX}{device_id}"
     try:
-        await redis_client.rpush(key, sample)
+        await redis_client.rpush(key, magnitude)
+        await redis_client.ltrim(key, -BUFFER_MAX_LENGTH, -1)
         buffer_length = await redis_client.llen(key)
-
-        # Fixed windowing: dispatch once a full window is available, consuming
-        # exactly that many samples. Any excess samples beyond the window are
-        # retained so they seed the next window instead of being discarded.
-        if buffer_length < BUFFER_DISPATCH_THRESHOLD:
-            return
-
-        raw = await redis_client.lrange(key, 0, BUFFER_DISPATCH_THRESHOLD - 1)
-        # Consume the window before dispatching: if the broker call fails we
-        # lose one window rather than re-analysing the same window forever.
-        await redis_client.ltrim(key, BUFFER_DISPATCH_THRESHOLD, -1)
-
-        samples = _decode_samples(raw)
-        if len(samples) < BUFFER_DISPATCH_THRESHOLD:
-            logger.warning(
-                "Short vibration window for device %s: %d/%d samples",
-                telemetry.device_id,
-                len(samples),
-                BUFFER_DISPATCH_THRESHOLD,
+        if buffer_length >= BUFFER_DISPATCH_THRESHOLD:
+            raw = await redis_client.lrange(key, 0, -1)
+            samples = [float(v) for v in raw]
+            process_vibration_window.delay(
+                device_id, samples, sample_rate_hz=BUFFER_SAMPLE_RATE_HZ
             )
-            return
-
-        # Bound the backlog.
-        remaining = await redis_client.llen(key)
-        if remaining > BUFFER_MAX_LENGTH:
-            await redis_client.ltrim(key, -BUFFER_MAX_LENGTH, -1)
-            logger.warning(
-                "Trimmed vibration backlog for %s: %d -> %d samples",
-                telemetry.device_id,
-                remaining,
-                BUFFER_MAX_LENGTH,
-            )
-
-        process_vibration_window.delay(telemetry.device_id, samples)
     except Exception:
         logger.exception(
-            "Vibration buffer update failed for device %s",
-            telemetry.device_id,
+            "Vibration buffer update failed for device %s", device_id
         )
 
 
@@ -152,7 +91,7 @@ async def mqtt_consumer() -> None:
                 hostname=settings.mqtt_host,
                 port=settings.mqtt_port,
             ) as client:
-                await client.subscribe(TELEMETRY_TOPIC, qos=1)
+                await client.subscribe(TELEMETRY_TOPIC)
                 logger.info(
                     "MQTT connected, subscribed to %s", TELEMETRY_TOPIC
                 )

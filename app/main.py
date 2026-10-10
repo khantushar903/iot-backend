@@ -1,7 +1,5 @@
 import asyncio
-import json
 import logging
-import time
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import (
@@ -22,7 +20,6 @@ from app.models import Telemetry
 from app.mqtt import mqtt_consumer
 from app.redis import (
     LIVE_TELEMETRY_CHANNEL,
-    publish_live_telemetry,
     get_live_telemetry_pubsub,
     redis_client,
 )
@@ -152,12 +149,19 @@ async def create_telemetry(
     payload: TelemetryCreate,
     db: AsyncSession = Depends(get_db),
 ):
-    record = await crud.create_telemetry(db, payload)
-    response = TelemetryResponse.model_validate(record)
-    await publish_live_telemetry(
-        json.dumps({"type": "telemetry", "data": response.model_dump(mode="json")})
-    )
-    return response
+    record = Telemetry(**payload.model_dump())
+    db.add(record)
+    try:
+        await db.commit()
+        await db.refresh(record)
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to store telemetry from %s", payload.device_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to store telemetry",
+        )
+    return record
 
 
 @app.get("/telemetry/latest", response_model=list[TelemetryResponse])
@@ -169,15 +173,13 @@ async def get_latest_telemetry(db: AsyncSession = Depends(get_db)):
 
 
 SNAPSHOT_SIZE = 10
-_WS_PING_INTERVAL_S = 10.0
-_WS_PONG_TIMEOUT_S = 30.0
+_WS_IDLE_PING_S = 20.0
 
 
 @app.websocket("/ws/telemetry")
 async def telemetry_websocket(websocket: WebSocket):
     await websocket.accept()
     pubsub = get_live_telemetry_pubsub()
-    last_frame_at = last_ping_at = time.monotonic()
     try:
         await pubsub.subscribe(LIVE_TELEMETRY_CHANNEL)
 
@@ -197,35 +199,18 @@ async def telemetry_websocket(websocket: WebSocket):
                 for record in reversed(records)
             ],
         }
-        last_ping_at = time.monotonic()
         await websocket.send_json(snapshot)
         logger.info("Dashboard connected, snapshot sent")
 
         while True:
-            try:
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True,
-                    timeout=0,
-                )
-                if message is None:
-                    if time.monotonic() - last_frame_at > WS_PONG_TIMEOUT_S:
-                        logger.info(
-                            "Dashboard client unresponsive for %.0fs, closing",
-                            time.monotonic() - last_frame_at,
-                        )
-                        break
-                    if time.monotonic() - last_ping_at >= _WS_PING_INTERVAL_S:
-                        await websocket.send_text('{"type":"ping"}')
-                        last_ping_at = time.monotonic()
-                    await asyncio.sleep(0.5)
-                    continue
-                if message["type"] != "message":
-                    continue
-                await websocket.send_text(message["data"])
-                last_frame_at = last_ping_at = time.monotonic()
-            except WebSocketDisconnect:
-                logger.info("Dashboard client disconnected (send)")
-                break
+            message = await pubsub.get_message(
+                ignore_subscribe_messages=True,
+                timeout=_WS_IDLE_PING_S,
+            )
+            if message is None or message["type"] != "message":
+                await websocket.send_text('{"type":"ping"}')
+                continue
+            await websocket.send_text(message["data"])
     except WebSocketDisconnect:
         logger.info("Dashboard client disconnected")
     except Exception:

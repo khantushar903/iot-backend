@@ -1,253 +1,71 @@
-"""Vibration analysis for a buffered window of accelerometer samples.
-
-`analyze_window` is pure: samples in, metrics dict out. It holds all of the
-signal-processing math and can be exercised without Redis, Celery, or a
-database. `process_vibration_window` is the thin Celery wrapper that adds
-alert-lifecycle handling and persistence.
-
-Signal model
-------------
-Each sample is a 3-axis acceleration reading taken by the device and timestamped
-with `ts`. Gravity is a constant offset on whichever axis the board is mounted
-on, so rather than assuming an orientation we remove the DC component of each
-axis independently. That subtraction *is* the gravity removal, and it also
-removes any slow bias, which is why every metric below is computed from the
-detrended (AC) signal.
-
-Sampling rate is derived from the sample timestamps rather than assumed. An
-assumed rate silently scales the whole frequency axis by the ratio between the
-real and assumed rate, so the timestamps are used when they are usable and the
-configured fallback is used (and flagged) when they are not.
-"""
-
-from __future__ import annotations
-
+import asyncio
 import json
 import logging
-from datetime import datetime, timezone
 
 import numpy as np
-from asgiref.sync import async_to_sync
 from scipy import fft
+from scipy.integrate import cumulative_trapezoid
 
-from app.alert_state import (
-    Decision,
-    alert_severity,
-    classify_rms,
-    decide,
-    entry_threshold,
-)
 from app.celery_app import celery_app
-from app.config import vibration
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, engine
 from app.models import Alert
-from app.redis import (
-    LIVE_TELEMETRY_CHANNEL,
-    load_alert_state,
-    redis_client,
-    save_alert_state,
-)
+from app.redis import LIVE_TELEMETRY_CHANNEL, redis_client
 from app.schemas import AlertResponse
 
 logger = logging.getLogger("iot-backend")
 
+ISO_10816_ZONES = [
+    (None, 1.12, "A", "Good"),
+    (1.12, 2.80, "B", "Satisfactory"),
+    (2.80, 7.10, "C", "Unsatisfactory"),
+    (7.10, None, "D", "Unacceptable"),
+]
+
 METRIC = "vibration"
 
-AXES = ("x", "y", "z")
-
-_TS_UNIT_SECONDS = {"ms": 1e-3, "s": 1.0, "us": 1e-6}
+_worker_loop: asyncio.AbstractEventLoop | None = None
 
 
-def estimate_sample_rate_hz(
-    timestamps: list[int] | None, sample_count: int
-) -> tuple[float, str]:
-    """Derive the sampling rate from device timestamps.
-
-    Returns ``(rate_hz, source)`` where source is ``"timestamps"`` when the
-    measurement is trustworthy or ``"fallback"`` when it had to be guessed.
-    """
-    fallback = vibration.fallback_sample_rate_hz
-    scale = _TS_UNIT_SECONDS[vibration.ts_unit.lower()]
-
-    if timestamps is None or len(timestamps) < 2:
-        return fallback, "fallback"
-
-    values = np.asarray(timestamps, dtype=float)
-    if not np.all(np.isfinite(values)):
-        return fallback, "fallback"
-
-    span_s = (values[-1] - values[0]) * scale
-    if span_s <= 0:
-        logger.warning(
-            "Non-increasing timestamps over %d samples (span %.3fs); "
-            "falling back to %.1f Hz",
-            sample_count,
-            span_s,
-            fallback,
-        )
-        return fallback, "fallback"
-
-    rate = (sample_count - 1) / span_s
-    if not (
-        vibration.min_sample_rate_hz
-        <= rate
-        <= vibration.max_sample_rate_hz
-    ):
-        logger.warning(
-            "Implausible sample rate %.2f Hz from timestamps; "
-            "falling back to %.1f Hz",
-            rate,
-            fallback,
-        )
-        return fallback, "fallback"
-
-    return float(rate), "timestamps"
+@celery_app.signals.worker_process_init.connect
+def _init_worker_loop(**kwargs) -> None:
+    """Create a single persistent event loop for each Celery worker process."""
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
+        logger.info("Worker process event loop initialized")
 
 
-def analyze_window(samples: list[dict]) -> dict:
-    """Compute time-domain and frequency-domain metrics for one window.
-
-    ``samples`` is a list of ``{"x": float, "y": float, "z": float,
-    "ts": int | None}`` dicts in arrival order.
-    """
-    if len(samples) < 2:
-        raise ValueError("a vibration window needs at least 2 samples")
-
-    axes = {
-        axis: np.asarray([float(s[axis]) for s in samples], dtype=float)
-        for axis in AXES
-    }
-    for axis, values in axes.items():
-        if not np.all(np.isfinite(values)):
-            raise ValueError(f"axis {axis} contains non-finite samples")
-
-    raw_timestamps = [s.get("ts") for s in samples]
-    timestamps = None if any(t is None for t in raw_timestamps) else raw_timestamps
-    rate_hz, rate_source = estimate_sample_rate_hz(timestamps, len(samples))
-    dt = 1.0 / rate_hz
-
-    # DC removal per axis == gravity removal + bias removal.
-    ac = {axis: values - values.mean() for axis, values in axes.items()}
-
-    n = len(samples)
-    resultant = np.sqrt(sum(ac[axis] ** 2 for axis in AXES))
-
-    rms = {axis: float(np.sqrt(np.mean(ac[axis] ** 2))) for axis in AXES}
-    rms_resultant = float(np.sqrt(np.mean(resultant**2)))
-    peak = {axis: float(np.max(np.abs(ac[axis]))) for axis in AXES}
-    peak_resultant = float(np.max(resultant))
-    crest = (
-        float(peak_resultant / rms_resultant) if rms_resultant > 0 else 0.0
-    )
-
-    # Windowing matters here: a rectangular window leaks enough energy into the
-    # neighbouring bins that argmax can report a frequency that is not in the
-    # signal, which makes every derived frequency number untrustworthy.
-    taper = np.hanning(n)
-    freqs = fft.rfftfreq(n, d=dt)
-    nyquist = rate_hz / 2.0
-
-    spectra: dict[str, np.ndarray] = {}
-    energy = np.zeros(freqs.size)
-    dominant_by_axis: dict[str, float] = {}
-
-    for axis in AXES:
-        magnitude = np.abs(fft.rfft(ac[axis] * taper))
-        magnitude[0] = 0.0  # ignore the residual DC bin
-        spectra[axis] = magnitude
-        energy += magnitude**2
-        dominant_by_axis[axis] = float(freqs[int(np.argmax(magnitude))])
-
-    total_energy = float(energy.sum())
-    hf_mask = freqs >= nyquist * vibration.hf_band_start_fraction
-    hf_energy = float(energy[hf_mask].sum())
-    hf_energy_ratio = hf_energy / total_energy if total_energy > 0 else 0.0
-
-    peak_bin = int(np.argmax(energy))
-    dominant_axis = max(AXES, key=lambda a: spectra[a][peak_bin])
-
-    return {
-        "window_samples": n,
-        "window_duration_s": round(n / rate_hz, 6),
-        "sample_rate_hz": round(rate_hz, 4),
-        "sample_rate_source": rate_source,
-        "rms_accel_m_s2": round(rms_resultant, 6),
-        "rms_x_m_s2": round(rms["x"], 6),
-        "rms_y_m_s2": round(rms["y"], 6),
-        "rms_z_m_s2": round(rms["z"], 6),
-        "peak_accel_m_s2": round(peak_resultant, 6),
-        "peak_x_m_s2": round(peak["x"], 6),
-        "peak_y_m_s2": round(peak["y"], 6),
-        "peak_z_m_s2": round(peak["z"], 6),
-        "crest_factor": round(crest, 4),
-        "dominant_frequency_hz": round(float(freqs[peak_bin]), 4),
-        "dominant_axis": dominant_axis,
-        "dominant_frequency_x_hz": round(dominant_by_axis["x"], 4),
-        "dominant_frequency_y_hz": round(dominant_by_axis["y"], 4),
-        "dominant_frequency_z_hz": round(dominant_by_axis["z"], 4),
-        "hf_energy_ratio": round(hf_energy_ratio, 4),
-        "spectral_escalation": bool(
-            hf_energy_ratio >= vibration.hf_energy_ratio_escalate
-            and crest >= vibration.crest_factor_escalate
-        ),
-        "rms_severity": classify_rms(rms_resultant),
-    }
+def run_async(coro) -> None:
+    """Run an async coroutine on the worker process's persistent event loop."""
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
+    _worker_loop.run_until_complete(coro)
 
 
-def _build_message(
-    metrics: dict, decision: Decision, rms_severity: str
-) -> str:
-    rms = metrics["rms_accel_m_s2"]
-    note = (
-        ""
-        if metrics["sample_rate_source"] == "timestamps"
-        else " (sample rate assumed - device timestamps unusable)"
-    )
+@celery_app.signals.worker_process_shutdown.connect
+def _shutdown_worker_loop(**kwargs) -> None:
+    """Cleanly dispose of DB and Redis connections before the worker exits."""
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        return
+    try:
+        _worker_loop.run_until_complete(engine.dispose())
+    except Exception:
+        logger.exception("Failed to dispose database engine on worker shutdown")
+    try:
+        _worker_loop.run_until_complete(redis_client.aclose())
+    except Exception:
+        logger.exception("Failed to close Redis client on worker shutdown")
+    try:
+        _worker_loop.close()
+    except Exception:
+        logger.exception("Failed to close worker event loop")
+    _worker_loop = None
+    logger.info("Worker process event loop shut down cleanly")
 
-    if decision.kind == "resolution":
-        return f"Vibration returned to normal: RMS {rms:.2f} m/s^2{note}."
-
-    if decision.kind == "deescalation":
-        return (
-            f"Vibration reduced to {decision.severity}: RMS "
-            f"{rms:.2f} m/s^2{note}."
-        )
-
-    if decision.kind == "reminder":
-        lead = "Still"
-    elif rms_severity != decision.severity:
-        lead = f"Escalated from {rms_severity} - spectral signature"
-    else:
-        lead = ""
-
-    detail = (
-        f"dominant {metrics['dominant_frequency_hz']:.1f} Hz on "
-        f"{metrics['dominant_axis'].upper()}, crest "
-        f"{metrics['crest_factor']:.2f}, HF energy "
-        f"{metrics['hf_energy_ratio'] * 100:.0f}%"
-    )
-    return (
-        f"{lead} acceleration RMS {rms:.2f} m/s^2 "
-        f"(threshold {entry_threshold(decision.severity):.2f}), {detail}"
-        f"{note}."
-    ).lstrip()
-
-
-def _alert_payload(
-    device_id: str,
-    metrics: dict,
-    decision: Decision,
-    rms_severity: str,
-) -> dict:
-    threshold = entry_threshold(decision.severity)
-    return {
-        "device_id": device_id,
-        "severity": alert_severity(decision),
-        "metric": METRIC,
-        "value": metrics["rms_accel_m_s2"],
-        "threshold": threshold,
-        "message": _build_message(metrics, decision, rms_severity),
-    }
 
 
 async def _persist_and_broadcast(alert_data: dict) -> None:
@@ -272,52 +90,71 @@ async def _persist_and_broadcast(alert_data: dict) -> None:
 def process_vibration_window(
     self,
     device_id: str,
-    samples: list[dict],
+    accel_samples: list[float],
+    sample_rate_hz: int = 1,
 ) -> dict:
-    """Analyze one buffered window and run the alert lifecycle for a device."""
-    metrics = analyze_window(samples)
-    rms_severity = metrics["rms_severity"]
-    rms_value = metrics["rms_accel_m_s2"]
+    if not accel_samples:
+        raise ValueError("accel_samples must not be empty")
 
-    now = datetime.now(timezone.utc).timestamp()
-    previous = load_alert_state(device_id)
-    decision = decide(
-        previous,
-        rms_value,
-        metrics["spectral_escalation"],
-        now,
-    )
+    arr = np.asarray(accel_samples, dtype=float)
+    dt = 1.0 / sample_rate_hz
 
-    if decision.emit:
-        last_alert_at = now
+    velocity = cumulative_trapezoid(arr - arr.mean(), dx=dt, initial=0.0)
+    rms_velocity = float(np.sqrt(np.mean(velocity**2)) * 1000.0)
+
+    freqs = fft.rfftfreq(len(arr), d=dt)
+    spectrum = np.abs(fft.rfft(arr - arr.mean()))
+    peak_index = int(np.argmax(spectrum))
+    peak_freq = float(freqs[peak_index])
+
+    zone = None
+    zone_name = None
+    severity = None
+    threshold = None
+    for lower, upper, code, name in ISO_10816_ZONES:
+        if (lower is None or rms_velocity >= lower) and (
+            upper is None or rms_velocity < upper
+        ):
+            zone = code
+            zone_name = name
+            threshold = upper if upper is not None else lower
+            break
+
+    if zone in ("C", "D"):
+        severity = "WARNING" if zone == "C" else "CRITICAL"
+        message = (
+            f"Vibration {rms_velocity:.2f} mm/s in ISO 10816 zone {zone} "
+            f"({zone_name}) — requires attention"
+        )
     else:
-        last_alert_at = previous.last_alert_at
-    save_alert_state(device_id, decision.severity, last_alert_at, now=now)
+        severity = None
+        message = ""
 
     result = {
         "device_id": device_id,
-        **metrics,
-        "previous_severity": previous.severity,
-        "severity": decision.severity,
-        "alert_kind": decision.kind,
-        "decision_reason": decision.reason,
-        "alert_raised": decision.emit,
+        "rms_velocity_mm_s": rms_velocity,
+        "peak_frequency_hz": peak_freq,
+        "iso_zone": zone,
+        "iso_zone_name": zone_name,
+        "severity": severity,
+        "alert_raised": severity is not None,
     }
 
-    if not decision.emit:
-        return result
-
-    alert_data = _alert_payload(device_id, metrics, decision, rms_severity)
-    try:
-        async_to_sync(_persist_and_broadcast)(alert_data)
-    except Exception:
-        logger.exception("Failed to persist/broadcast alert for %s", device_id)
-    logger.warning(
-        "Alert (%s/%s) for %s: %s",
-        decision.kind,
-        decision.severity,
-        device_id,
-        alert_data["message"],
-    )
+    if severity is not None:
+        alert_data = {
+            "device_id": device_id,
+            "severity": severity,
+            "metric": METRIC,
+            "value": rms_velocity,
+            "threshold": threshold,
+            "message": message,
+        }
+        run_async(_persist_and_broadcast(alert_data))
+        logger.warning(
+            "Alert raised for device %s: %s (%.2f mm/s)",
+            device_id,
+            severity,
+            rms_velocity,
+        )
 
     return result

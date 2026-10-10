@@ -277,96 +277,53 @@ celery_app.conf.update(task_serializer="json", result_serializer="json",
 
 `settings.redis_url` is read via pydantic-settings from `.env`, so the worker and API agree on the broker. The worker container runs `celery -A app.analytics.celery_app worker --loglevel=info` — note the app module is `analytics.py`, because that is where the actual task lives.
 
-### 2.10 `app/analytics.py` — the signal analysis worker
+### 2.10 `app/analytics.py` — the FFT / ISO 10816 worker
 
-The task is split in two so the math can be tested without any infrastructure:
-
-- `analyze_window(samples) -> dict` — **pure**. Samples in, metrics out. No Redis, no Celery, no database.
-- `process_vibration_window(device_id, samples)` — the `@celery_app.task(bind=True)` wrapper. Calls the pure function, runs the alert lifecycle, and does the I/O.
+`process_vibration_window` is a `@celery_app.task` decorated with `bind=True` (so `self` gives task controls). It is a normal sync Python function — worker threads run it — and it deliberately does the pure-math first, then bridges into async I/O only for the alert side-effect:
 
 ```python
-# 1. Gravity + bias removal, per axis (orientation-agnostic)
-ac = {axis: values - values.mean() for axis in ("x", "y", "z")}
+velocity = cumulative_trapezoid(arr - arr.mean(), dx=dt, initial=0.0)   # accel → velocity
+rms_velocity = float(np.sqrt(np.mean(velocity**2)) * 1000.0)            # → mm/s RMS
+freqs  = fft.rfftfreq(len(arr), d=dt)                                    # FFT bins
+spectrum = np.abs(fft.rfft(arr - arr.mean()))
+peak_freq = float(freqs[int(np.argmax(spectrum))])                       # dominant Hz
 
-# 2. Sample rate from the device's own timestamps, not an assumption
-rate_hz, source = estimate_sample_rate_hz(timestamps, len(samples))
-
-# 3. Time domain
-rms_resultant = float(np.sqrt(np.mean(np.sqrt(sum(ac[a] ** 2 for a in AXES)) ** 2)))
-crest = float(peak_resultant / rms_resultant)
-
-# 4. Frequency domain - the taper is not optional
-taper = np.hanning(len(samples))
-spectrum = np.abs(fft.rfft(ac["z"] * taper))
-dominant_hz = float(freqs[int(np.argmax(spectrum))])
+for lower, upper, code, name in ISO_10816_ZONES:   # A/B/C/D lookup
+    if (lower is None or rms_velocity >= lower) and (upper is None or rms_velocity < upper):
+        zone, threshold = code, upper; break
 ```
 
-**Why the Hann taper.** Without it, spectral leakage spreads a tone's energy across neighbouring bins, and `argmax` will happily report a frequency that is not in the signal. Every frequency number this system reports is downstream of that choice.
+When the zone is `C` or `D`, the task builds an alert and calls the async bridge `run_async(_persist_and_broadcast(alert_data))`. Inside that coroutine a dedicated `AsyncSessionLocal` inserts the `Alert`, then the committed record is serialized with `AlertResponse` and published as `{"type":"alert","data":{...}}` to `live_telemetry`. Because this is a raw `redis.asyncio` client, it must run inside an event loop.
 
-**Why per-axis DC removal.** Gravity is a constant offset on whichever axis the board is mounted on. Subtracting each axis's own mean removes it regardless of orientation, and removes slow bias with it. That is why the MQTT buffer keeps all three axes rather than collapsing to a magnitude at ingest — collapsing to `√(x²+y²+z²)` first bakes in a ~9.81 m/s² offset and folds real vibration into it non-linearly.
+**Why `run_async`, not `asyncio.run`.** Calling `asyncio.run(...)` per task would create and destroy an event loop on every dispatch. The module-level `AsyncSessionLocal` engine and `redis_client` would then try to reuse connections bound to a *closed* loop — the classic `RuntimeError: Event loop is closed` / `Future attached to a different loop`. Instead, `app/analytics.py` keeps one loop alive per worker process:
 
-**Why the sample rate comes from timestamps.** A hardcoded rate scales the entire frequency axis by `actual / assumed` and produces confident, plausible, wrong numbers. `estimate_sample_rate_hz` rejects missing, non-increasing, or implausible timestamps and falls back to `VIBRATION_FALLBACK_SAMPLE_RATE_HZ`, reporting `sample_rate_source: "fallback"` so the caveat travels with the data.
+```python
+_worker_loop: asyncio.AbstractEventLoop | None = None
 
-### 2.11 `app/alert_state.py` — the alert lifecycle
+@celery_app.signals.worker_process_init.connect
+def _init_worker_loop(**kwargs):
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
 
-`decide(previous_state, rms_m_s2, spectral_escalation, now)` returns a `Decision(severity, emit, kind, reason)`. It is pure and synchronous: no Redis, no clock, no config reads beyond the threshold values.
+def run_async(coro):
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
+    _worker_loop.run_until_complete(coro)
 
-**Hysteresis** — each severity has an *entry* level and a lower *release* level (`WARNING` enters at 2.0, releases below 1.6). A severity is never released while the metric is still at or above its release level. Without this, a motor idling at 1.8 m/s² flaps every window and writes an alert row on each flap.
-
-**Cooldown** — while a severity stays active it re-emits only after `VIBRATION_ALERT_COOLDOWN_S` (default 300 s). Without this, an unhealthy motor produces one alert row per window, indefinitely.
-
-**Spectral escalation** — `hf_energy_ratio ≥ 0.30` **and** `crest_factor ≥ 3.5` promotes one step, including from `NORMAL` to `WARNING` when `VIBRATION_SPECTRAL_ESCALATION_FROM_NORMAL` is on. This is the case a pure RMS threshold is blind to: impulsive broadband energy while overall RMS is still nominal. Both conditions are required, so smooth broadband noise cannot trigger it.
-
-| `kind` | When | Alert row |
-| --- | --- | --- |
-| `escalation` | Severity rose | new severity |
-| `deescalation` | Dropped but above `NORMAL` | new severity |
-| `reminder` | Still breaching after cooldown | unchanged |
-| `resolution` | Returned to `NORMAL` | `RESOLVED` |
-| `none` | Suppressed or steady | no row |
-
-**State** is one JSON blob per device at `alert_state:{device_id}`, written through the **blocking** `sync_redis_client` — reading one key is not worth an event-loop bridge. Reads and writes are wrapped so they never raise: a Redis outage costs hysteresis history, not vibration analysis.
-
-### 2.12 The async bridge
-
-When `decide` returns `emit=True`, the task bridges with `async_to_sync(_persist_and_broadcast(alert_data))`. Inside that coroutine a dedicated `AsyncSessionLocal` inserts the `Alert`, then the committed record is serialized with `AlertResponse` and published as `{"type":"alert","data":{...}}` to `live_telemetry`.
-
-`async_to_sync` runs on a fresh loop per call, which is safe **because** the engine uses `NullPool` (Part 2.2): no connection is cached across loops, so there is nothing to reuse against a closed loop. If you ever switch the engine to a real pool, this must be revisited — reintroducing a persistent per-process loop created via `worker_process_init` would then be necessary.
-
-### 2.13 Verifying the analysis
-
-`scripts/check_analytics.py` exercises the pure functions against synthetic signals with analytically known answers — gravity removal, frequency recovery from an off-bin tone, sample-rate fallback, hysteresis at each boundary, cooldown and resolution, and spectral escalation on impulsive-but-quiet vibration:
-
-```bash
-python -m scripts.check_analytics
+@celery_app.signals.worker_process_shutdown.connect
+def _shutdown_worker_loop(**kwargs):
+    if _worker_loop is None or _worker_loop.is_closed():
+        return
+    _worker_loop.run_until_complete(engine.dispose())
+    _worker_loop.run_until_complete(redis_client.aclose())
+    _worker_loop.close()
 ```
 
-It needs no running stack. To exercise the full task path (Redis, Postgres, a worker):
-
-```bash
-python -m scripts.test_vibration_task
-```
-
-### 2.14 Tuning via environment
-
-Every threshold is a `VIBRATION_*` environment variable (see `app/config.py`), which is what makes the alerting experiment repeatable without code changes:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `VIBRATION_WINDOW_SAMPLES` | 512 | Samples per analysis window |
-| `VIBRATION_FALLBACK_SAMPLE_RATE_HZ` | 50.0 | Rate assumed when timestamps are unusable |
-| `VIBRATION_TS_UNIT` | `ms` | Unit of the `ts` payload field |
-| `VIBRATION_WARNING_RMS_M_S2` | 2.0 | `WARNING` entry level |
-| `VIBRATION_CRITICAL_RMS_M_S2` | 5.0 | `CRITICAL` entry level |
-| `VIBRATION_WARNING_CLEAR_RMS_M_S2` | 1.6 | `WARNING` release level |
-| `VIBRATION_CRITICAL_CLEAR_RMS_M_S2` | 4.0 | `CRITICAL` release level |
-| `VIBRATION_HF_BAND_START_FRACTION` | 0.5 | HF band start, as a fraction of Nyquist |
-| `VIBRATION_HF_ENERGY_RATIO_ESCALATE` | 0.30 | HF energy ratio needed to escalate |
-| `VIBRATION_CREST_FACTOR_ESCALATE` | 3.5 | Crest factor needed to escalate |
-| `VIBRATION_SPECTRAL_ESCALATION_FROM_NORMAL` | `true` | May the spectrum raise a `WARNING` at nominal RMS |
-| `VIBRATION_ALERT_COOLDOWN_S` | 300.0 | Minimum gap between alerts for one active condition |
-
-`VibrationSettings` validates these on startup, so a clear level above its entry level, or a window too short to produce a usable spectrum, fails fast rather than silently mis-alerting.
+Every subsequent task dispatch reuses that same loop, so the pooled DB/Redis connections stay bound to a loop that is still running, and the `worker_process_shutdown` listener disposes everything cleanly before the fork exits. `NullPool` on the engine (Part 2.2) is a second, independent safety net.
 
 ---
 
@@ -510,7 +467,7 @@ curl -X POST http://localhost:8000/api/v1/alerts \
     "metric": "vibration",
     "value": 9.2,
     "threshold": 7.1,
-    "message": "CRITICAL acceleration RMS 6.42 m/s^2 (threshold 5.00), dominant 47.0 Hz on X, crest 3.10, HF energy 21%."
+    "message": "Vibration 9.20 mm/s in ISO 10816 zone D (Unacceptable)"
   }' -w '\nHTTP %{http_code}\n'   # expect 201 with the created alert
 
 # Read it back (newest first)
@@ -539,7 +496,7 @@ print(process_vibration_window.signature(
 "
 ```
 
-A window this energetic clears the CRITICAL threshold, so the worker persists an `Alert`, broadcasts `{"type":"alert",...}` to `live_telemetry`, and the returned dict shows `severity: "CRITICAL"` / `alert_raised: True`. Watch `docker compose logs -f celery_worker` to see the `Alert raised for device ...` line, then confirm the row at `GET /api/v1/alerts` or in Adminer (`alerts` table).
+A window this energetic lands in Zone D, so the worker persists an `Alert`, broadcasts `{"type":"alert",...}` to `live_telemetry`, and the returned dict shows `severity: "CRITICAL"` / `alert_raised: True`. Watch `docker compose logs -f celery_worker` to see the `Alert raised for device ...` line, then confirm the row at `GET /api/v1/alerts` or in Adminer (`alerts` table).
 
 ---
 
@@ -566,7 +523,7 @@ Known log lines and what they mean:
 | `Vibration buffer update failed for device X` | Redis list push/trim for the sliding window errored | Check redis container; the telemetry record itself is already stored |
 | `Redis publish to live_telemetry failed` | Streaming degraded; storage unaffected | Check redis container |
 | `MQTT error: ... reconnecting in Ns` | Broker blip; backoff in progress | Usually self-heals |
-| `Alert (escalation/CRITICAL) for device X: ...` | Analytics engine persisted + broadcast an alert | Expected WARNING/CRITICAL output — inspect `GET /api/v1/alerts` |
+| `Alert raised for device X: CRITICAL (...) mm/s` | Analytics engine persisted + broadcast an alert | Expected WARNING/CRITICAL output — inspect `GET /api/v1/alerts` |
 | `Dashboard client disconnected` | Normal WS close | Nothing |
 
 ### 4.2 Database connection problems
@@ -636,7 +593,7 @@ docker compose exec redis redis-cli SUBSCRIBE live_telemetry
 | Container | Ports | Role |
 | --- | --- | --- |
 | `iot-api` | 8000 | FastAPI: REST + `/ws/telemetry` + Swagger at `/docs` |
-| `iot-celery-worker` | (none) | Celery worker: RMS + FFT analysis, alert lifecycle, alert persistence |
+| `iot-celery-worker` | (none) | Celery worker: FFT + ISO 10816 analysis, alert persistence |
 | `iot-postgres` | 5432 | Storage: `telemetry_records` + `alerts` (`iot_user` / `iot_password` / `iot_db`) |
 | `iot-redis` | 6379 | Pub/Sub backbone (`live_telemetry`) + Celery broker/backend |
 | `iot-mosquitto` | 1883 / 9001 | MQTT broker (TCP / WS) |

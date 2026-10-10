@@ -78,24 +78,10 @@ services:
     build: .
     container_name: iot-celery-worker
     restart: unless-stopped
-    command: celery -A app.celery_app worker --loglevel=info
+    command: celery -A app.analytics.celery_app worker --loglevel=info
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-iot_user}:${POSTGRES_PASSWORD:-iot_password}@postgres:5432/${POSTGRES_DB:-iot_db}
       REDIS_URL: redis://redis:6379/0
-      # Condition-monitoring parameters. These are the defaults declared in
-      # app/config.py; set them here (or in .env) to re-run the alerting
-      # experiment with different thresholds without a code change.
-      VIBRATION_WINDOW_SAMPLES: "512"
-      VIBRATION_FALLBACK_SAMPLE_RATE_HZ: "50.0"
-      VIBRATION_TS_UNIT: "ms"
-      VIBRATION_WARNING_RMS_M_S2: "2.0"
-      VIBRATION_CRITICAL_RMS_M_S2: "5.0"
-      VIBRATION_WARNING_CLEAR_RMS_M_S2: "1.6"
-      VIBRATION_CRITICAL_CLEAR_RMS_M_S2: "4.0"
-      VIBRATION_HF_ENERGY_RATIO_ESCALATE: "0.30"
-      VIBRATION_CREST_FACTOR_ESCALATE: "3.5"
-      VIBRATION_SPECTRAL_ESCALATION_FROM_NORMAL: "true"
-      VIBRATION_ALERT_COOLDOWN_S: "300"
     depends_on:
       postgres:
         condition: service_healthy
